@@ -3,7 +3,7 @@
   * Plugin Name: Order Simulator for WooCommerce
   * Plugin URI: http://www.75nineteen.com
   * Description: Automate orders to generate WooCommerce storefronts at scale for testing purposes.
-  * Version: 1.0.1
+  * Version: 1.0.2
   * Author: 75nineteen Media LLC
   * Author URI: http://www.75nineteen.com
 
