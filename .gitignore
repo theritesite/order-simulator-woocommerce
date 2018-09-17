@@ -1,6 +1,7 @@
 /node_modules
 yarn-error.log
-#yarn.lock
-#package.json
-#index.js
-#webpack.config.js
+yarn.lock
+package.json
+index.js
+webpack.config.js
+/order-simulatore-woocommerce
