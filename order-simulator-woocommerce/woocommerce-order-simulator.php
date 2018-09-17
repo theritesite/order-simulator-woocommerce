@@ -330,8 +330,7 @@ PRIMARY KEY  (number)
 
     public function get_random_user() {
         if ( !$this->users ) {
-            // $this->users  = get_users( array('role' => 'Subscriber', 'fields' => 'ID') );
-            $this->users  = get_users( array('role' => 'Customer', 'fields' => 'ID') );
+            $this->users  = get_users( array('role' => 'Subscriber', 'fields' => 'ID') );
         }
 
         $length = count($this->users);
