@@ -233,8 +233,10 @@ PRIMARY KEY  (number)
                 update_post_meta( $order_id, '_payment_method', 'bacs' );
                 update_post_meta( $order_id, '_payment_method_title', 'Bacs' );
 
-                update_post_meta( $order_id, '_shipping_method', 'free_shipping' );
-                update_post_meta( $order_id, '_shipping_method_title', 'Free Shipping' );
+                // update_post_meta( $order_id, '_shipping_method', 'free_shipping' );
+                // update_post_meta( $order_id, '_shipping_method_title', 'Free Shipping' );
+                update_post_meta( $order_id, '_shipping_method', 'flat_rate' );
+                update_post_meta( $order_id, '_shipping_method_title', 'Flat Rate' );
 
                 update_post_meta( $order_id, '_customer_user', absint( $user_id ) );
 
@@ -245,6 +247,31 @@ PRIMARY KEY  (number)
                 do_action( 'woocommerce_checkout_order_processed', $order_id, $data );
 
                 $order = new WC_Order($order_id);
+
+                $country_code = $order->get_shipping_country();
+
+				// Set the array for tax calculations
+				$calculate_tax_for = array(
+					'country' => $country_code,
+					'state' => '', // Can be set (optional)
+					'postcode' => '', // Can be set (optional)
+					'city' => '', // Can be set (optional)
+				);
+
+				// Optionally, set a total shipping amount
+				$new_ship_price = floatval( mt_rand( 300, 1000 ) / 100 );
+
+				// Get a new instance of the WC_Order_Item_Shipping Object
+				$item = new WC_Order_Item_Shipping();
+
+				$item->set_method_title( "Flat rate" );
+				$item->set_method_id( "flat_rate:4" );
+				$item->set_total( $new_ship_price ); // (optional)
+				$item->calculate_taxes($calculate_tax_for);
+
+				$order->add_item( $item );
+
+				$order->calculate_totals();
 
                 // figure out the order status
                 $status = 'completed';
