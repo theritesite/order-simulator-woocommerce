@@ -4,7 +4,7 @@
   "main": "index.js",
   "repository": "git@github.com:theritesite/order-simulator-woocommerce.git",
   "author": "Parker Mathewson <theritesites@gmail.com>",
-  "license": "MIT",
+  "license": "GPL-2.0",
   "scripts": {
     "start": "webpack --mode=development --env development --watch",
     "build": "webpack --mode=production --env production"
