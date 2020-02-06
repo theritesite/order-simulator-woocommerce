@@ -3,7 +3,7 @@
  * WooCommerce Order Simulator Settings
  *
  * @author      75nineteen
- * @version     1.0
+ * @version     1.1
  */
 
 if ( ! defined( 'ABSPATH' ) ) {

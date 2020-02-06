@@ -3,7 +3,7 @@
   * Plugin Name: Order Simulator for WooCommerce
   * Plugin URI: http://www.75nineteen.com
   * Description: Automate orders to generate WooCommerce storefronts at scale for testing purposes.
-  * Version: 1.0.1
+  * Version: 1.1.0
   * Author: 75nineteen Media LLC
   * Author URI: http://www.75nineteen.com
 
@@ -37,6 +37,8 @@ class WC_Order_Simulator {
 
         add_action( 'wcos_create_orders', array($this, 'create_orders_on_init') );
         $this->settings = self::get_settings();
+
+        add_action( 'woocommerce_order_status_completed', array( $this, 'trs_add_cost_of_shipping' ) );
 
     }
 
@@ -365,6 +367,36 @@ PRIMARY KEY  (number)
         $idx    = rand(0, $length-1);
 
         return $this->users[$idx];
+    }
+
+    public function trs_add_cost_of_shipping( $order_id ) {
+        update_post_meta( $order_id, '_wc_cost_of_shipping', 3.67 );
+        update_post_meta( $order_id, '_wc_cos_method', 'manual' );
+        $order = wc_get_order( $order_id );
+        if( ! empty( $order ) ) {
+            $first = mt_rand( 2, 6 );
+            $second = mt_rand( 0, 99 ) / 100;
+            $method = mt_rand( 1, 3 );
+            $third = 'manual';
+            switch ($method ) {
+                case 1:
+                    $third = 'wc-services';
+                break;
+                case 2:
+                    $third = 'shipstation';
+                break;
+                case 3:
+                default:
+                    $third = 'manual';
+                break;
+            }
+            $total = (float)$order->get_total();
+        //	$order->update_meta_data( '_wc_cost_of_shipping', $total );
+        //  $order->update_meta_data( '_wc_cost_of_shipping', ( $total / 6 ) + 0.24 );
+        //	$order->update_meta_data( '_wc_cos_method', 'manual' );
+            update_post_meta( $order_id, '_wc_cost_of_shipping', ( $total / $first ) + $second );
+            update_post_meta( $order_id, '_wc_cos_method', $third );
+        }
     }
 
 }
