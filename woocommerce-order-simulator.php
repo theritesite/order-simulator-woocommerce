@@ -3,7 +3,7 @@
   * Plugin Name: Order Simulator for WooCommerce
   * Plugin URI: http://www.75nineteen.com
   * Description: Automate orders to generate WooCommerce storefronts at scale for testing purposes.
-  * Version: 1.0.2
+  * Version: 1.1.0
   * Author: 75nineteen Media LLC
   * Author URI: http://www.75nineteen.com
 
@@ -37,6 +37,8 @@ class WC_Order_Simulator {
 
         add_action( 'wcos_create_orders', array($this, 'create_orders_on_init') );
         $this->settings = self::get_settings();
+
+        add_action( 'woocommerce_order_status_completed', array( $this, 'trs_add_cost_of_shipping' ) );
 
     }
 
@@ -233,8 +235,10 @@ PRIMARY KEY  (number)
                 update_post_meta( $order_id, '_payment_method', 'bacs' );
                 update_post_meta( $order_id, '_payment_method_title', 'Bacs' );
 
-                update_post_meta( $order_id, '_shipping_method', 'free_shipping' );
-                update_post_meta( $order_id, '_shipping_method_title', 'Free Shipping' );
+                // update_post_meta( $order_id, '_shipping_method', 'free_shipping' );
+                // update_post_meta( $order_id, '_shipping_method_title', 'Free Shipping' );
+                update_post_meta( $order_id, '_shipping_method', 'flat_rate' );
+                update_post_meta( $order_id, '_shipping_method_title', 'Flat Rate' );
 
                 update_post_meta( $order_id, '_customer_user', absint( $user_id ) );
 
@@ -245,6 +249,31 @@ PRIMARY KEY  (number)
                 do_action( 'woocommerce_checkout_order_processed', $order_id, $data );
 
                 $order = new WC_Order($order_id);
+
+                $country_code = $order->get_shipping_country();
+
+				// Set the array for tax calculations
+				$calculate_tax_for = array(
+					'country' => $country_code,
+					'state' => '', // Can be set (optional)
+					'postcode' => '', // Can be set (optional)
+					'city' => '', // Can be set (optional)
+				);
+
+				// Optionally, set a total shipping amount
+				$new_ship_price = floatval( mt_rand( 300, 1000 ) / 100 );
+
+				// Get a new instance of the WC_Order_Item_Shipping Object
+				$item = new WC_Order_Item_Shipping();
+
+				$item->set_method_title( "Flat rate" );
+				$item->set_method_id( "flat_rate:4" );
+				$item->set_total( $new_ship_price ); // (optional)
+				$item->calculate_taxes($calculate_tax_for);
+
+				$order->add_item( $item );
+
+				$order->calculate_totals();
 
                 // figure out the order status
                 $status = 'completed';
@@ -338,6 +367,36 @@ PRIMARY KEY  (number)
         $idx    = rand(0, $length-1);
 
         return $this->users[$idx];
+    }
+
+    public function trs_add_cost_of_shipping( $order_id ) {
+        update_post_meta( $order_id, '_wc_cost_of_shipping', 3.67 );
+        update_post_meta( $order_id, '_wc_cos_method', 'manual' );
+        $order = wc_get_order( $order_id );
+        if( ! empty( $order ) ) {
+            $first = mt_rand( 2, 6 );
+            $second = mt_rand( 0, 99 ) / 100;
+            $method = mt_rand( 1, 3 );
+            $third = 'manual';
+            switch ($method ) {
+                case 1:
+                    $third = 'wc-services';
+                break;
+                case 2:
+                    $third = 'shipstation';
+                break;
+                case 3:
+                default:
+                    $third = 'manual';
+                break;
+            }
+            $total = (float)$order->get_total();
+        //	$order->update_meta_data( '_wc_cost_of_shipping', $total );
+        //  $order->update_meta_data( '_wc_cost_of_shipping', ( $total / 6 ) + 0.24 );
+        //	$order->update_meta_data( '_wc_cos_method', 'manual' );
+            update_post_meta( $order_id, '_wc_cost_of_shipping', ( $total / $first ) + $second );
+            update_post_meta( $order_id, '_wc_cos_method', $third );
+        }
     }
 
 }
