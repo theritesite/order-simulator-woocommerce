@@ -38,7 +38,8 @@ class WC_Order_Simulator {
         add_action( 'wcos_create_orders', array($this, 'create_orders_on_init') );
         $this->settings = self::get_settings();
 
-        add_action( 'woocommerce_order_status_completed', array( $this, 'trs_add_cost_of_shipping' ) );
+
+        add_action( 'woocommerce_order_status_completed', array( $this, 'trs_add_costs' ) );
 
     }
 
@@ -369,7 +370,85 @@ PRIMARY KEY  (number)
         return $this->users[$idx];
     }
 
+    public function trs_add_costs( $order_id ) {
+
+        $default_cost_categories = array();
+        $costs_meta_extensions = apply_filters( 'trs_wc_np_order_cost_extension', array() );
+
+		$costs_meta_fields 	 = apply_filters( 'trs_wc_np_order_cost_meta_fields', array_values( wp_list_pluck( $costs_meta_extensions, 'key' ) ) );
+
+        if ( ! empty( $costs_meta_fields ) ) {
+			foreach ( $costs_meta_fields as $key => $cost_meta_key ) {
+
+				$current_key = trim( $cost_meta_key );
+
+				if ( isset( $costs_meta_extensions[$current_key]->category ) ) {
+					if ( false !== ( $found_index = array_search( $costs_meta_extensions[$current_key]->category, array_keys( $default_cost_categories ) ) ) ) {
+                        error_log( 'seems like the cost plugin is set?');
+						$default_cost_categories[$costs_meta_extensions[$current_key]->category] = $costs_meta_extensions[$current_key]->key;
+					} else {
+                        error_log( 'sus else');
+                        $default_cost_categories[$costs_meta_extensions[$current_key]->category] = $costs_meta_extensions[$current_key]->key;
+                    }
+				}
+			}
+		}
+
+        foreach( $default_cost_categories as $cost_category => $cost_key ) {
+            // error_log(wc_print_r(array($cost_category => $cost_key), true));
+            $order = wc_get_order( $order_id );
+            $stored_cog = '';
+            if( ! empty( $order ) ) {
+                $total = (float)$order->get_total();
+                if ( $cost_category === 'cost_of_shipping' ) {
+                    $first = mt_rand( 2, 6 );
+                    $second = mt_rand( 0, 99 ) / 100;
+                    update_post_meta( $order_id, $cost_key, ( $total / $first ) + $second );
+                    if ( $cost_key === '_wc_cost_of_shipping' ) {
+                        $method = mt_rand( 1, 3 );
+                        $third = 'manual';
+                        switch ($method ) {
+                            case 1:
+                                $third = 'wc-services';
+                            break;
+                            case 2:
+                                $third = 'shipstation';
+                            break;
+                            case 3:
+                            default:
+                                $third = 'manual';
+                            break;
+                        }
+                        update_post_meta( $order_id, '_wc_cos_method', $third );
+                    }
+                }
+                // error_log("b4storing to aoc");
+                if ( $cost_category === 'additional_costs' ) {
+                    $loop = mt_rand( 1,5 );
+                    $val = array();
+                    for ( $i = 0; $i < $loop; $i++ ) {
+                        
+                        $first = mt_rand( 1, 5 );
+                        $second = mt_rand( 0, 99 ) / 100;
+                        array_push( $val, array( 'label' => 'arg ' . $first, 'cost' => floatval( $first + $second ) ) );
+                    }
+                    error_log(wc_print_r($val, true));
+                    update_post_meta( $order_id, $cost_key, $val ); 
+                }
+                if ( $cost_category === 'cost_of_goods' ) {
+                    if ( ( $stored_cog = get_post_meta( $order_id, $cost_key, true ) ) && ( empty( $stored_cog ) || intval( $stored_cog ) <= 0 ) ) {
+                        $first = mt_rand( 3, 7 );
+                        $second = mt_rand( 0, 3 );
+                        $third = floatval( $total / $first ) + ( 0.25 * $second );
+                        update_post_meta( $order_id, $cost_key, floatval( $third ) ); 
+                    }
+                }
+            }
+        }
+
+    }
     public function trs_add_cost_of_shipping( $order_id ) {
+
         update_post_meta( $order_id, '_wc_cost_of_shipping', 3.67 );
         update_post_meta( $order_id, '_wc_cos_method', 'manual' );
         $order = wc_get_order( $order_id );
