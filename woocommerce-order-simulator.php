@@ -384,10 +384,10 @@ PRIMARY KEY  (number)
 
 				if ( isset( $costs_meta_extensions[$current_key]->category ) ) {
 					if ( false !== ( $found_index = array_search( $costs_meta_extensions[$current_key]->category, array_keys( $default_cost_categories ) ) ) ) {
-                        error_log( 'seems like the cost plugin is set?');
+                        // error_log( 'seems like the cost plugin is set?');
 						$default_cost_categories[$costs_meta_extensions[$current_key]->category] = $costs_meta_extensions[$current_key]->key;
 					} else {
-                        error_log( 'sus else');
+                        // error_log( 'sus else');
                         $default_cost_categories[$costs_meta_extensions[$current_key]->category] = $costs_meta_extensions[$current_key]->key;
                     }
 				}
@@ -432,7 +432,6 @@ PRIMARY KEY  (number)
                         $second = mt_rand( 0, 99 ) / 100;
                         array_push( $val, array( 'label' => 'arg ' . $first, 'cost' => floatval( $first + $second ) ) );
                     }
-                    error_log(wc_print_r($val, true));
                     update_post_meta( $order_id, $cost_key, $val ); 
                 }
                 if ( $cost_category === 'cost_of_goods' ) {
