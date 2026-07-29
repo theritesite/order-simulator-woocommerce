@@ -3,7 +3,7 @@
   * Plugin Name: Order Simulator for WooCommerce
   * Plugin URI: http://www.75nineteen.com
   * Description: Automate orders to generate WooCommerce storefronts at scale for testing purposes.
-  * Version: 1.1.0
+  * Version: 1.1.1
   * Author: 75nineteen Media LLC
   * Author URI: http://www.75nineteen.com
 
@@ -403,7 +403,7 @@ PRIMARY KEY  (number)
                 if ( $cost_category === 'cost_of_shipping' ) {
                     $first = mt_rand( 2, 6 );
                     $second = mt_rand( 0, 99 ) / 100;
-                    update_post_meta( $order_id, $cost_key, ( $total / $first ) + $second );
+                    $order->update_meta_data( $cost_key, ( $total / $first ) + $second );
                     if ( $cost_key === '_wc_cost_of_shipping' ) {
                         $method = mt_rand( 1, 3 );
                         $third = 'manual';
@@ -419,7 +419,7 @@ PRIMARY KEY  (number)
                                 $third = 'manual';
                             break;
                         }
-                        update_post_meta( $order_id, '_wc_cos_method', $third );
+                        $order->update_meta_data( '_wc_cos_method', $third );
                     }
                 }
                 // error_log("b4storing to aoc");
@@ -430,26 +430,27 @@ PRIMARY KEY  (number)
                         
                         $first = mt_rand( 1, 5 );
                         $second = mt_rand( 0, 99 ) / 100;
-                        array_push( $val, array( 'label' => 'arg ' . $first, 'cost' => floatval( $first + $second ) ) );
+                        array_push( $val, (object)array( 'label' => 'arg ' . $first, 'cost' => floatval( $first + $second ) ) );
                     }
-                    update_post_meta( $order_id, $cost_key, $val ); 
+                    $order->update_meta_data( $cost_key, json_encode($val) ); 
                 }
                 if ( $cost_category === 'cost_of_goods' ) {
                     if ( ( $stored_cog = get_post_meta( $order_id, $cost_key, true ) ) && ( empty( $stored_cog ) || intval( $stored_cog ) <= 0 ) ) {
                         $first = mt_rand( 3, 7 );
                         $second = mt_rand( 0, 3 );
                         $third = floatval( $total / $first ) + ( 0.25 * $second );
-                        update_post_meta( $order_id, $cost_key, floatval( $third ) ); 
+                        $order->update_meta_data( $cost_key, floatval( $third ) ); 
                     }
                 }
             }
+            $order->save();
         }
 
     }
     public function trs_add_cost_of_shipping( $order_id ) {
 
-        update_post_meta( $order_id, '_wc_cost_of_shipping', 3.67 );
-        update_post_meta( $order_id, '_wc_cos_method', 'manual' );
+        // update_post_meta( $order_id, '_wc_cost_of_shipping', 3.67 );
+        // update_post_meta( $order_id, '_wc_cos_method', 'manual' );
         $order = wc_get_order( $order_id );
         if( ! empty( $order ) ) {
             $first = mt_rand( 2, 6 );
@@ -472,8 +473,9 @@ PRIMARY KEY  (number)
         //	$order->update_meta_data( '_wc_cost_of_shipping', $total );
         //  $order->update_meta_data( '_wc_cost_of_shipping', ( $total / 6 ) + 0.24 );
         //	$order->update_meta_data( '_wc_cos_method', 'manual' );
-            update_post_meta( $order_id, '_wc_cost_of_shipping', ( $total / $first ) + $second );
-            update_post_meta( $order_id, '_wc_cos_method', $third );
+            $order->update_meta_data( '_wc_cost_of_shipping', ( $total / $first ) + $second );
+            $order->update_meta_data( '_wc_cos_method', $third );
+            $order->save();
         }
     }
 

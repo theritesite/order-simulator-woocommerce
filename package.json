@@ -5,33 +5,24 @@
   "repository": "git@github.com:theritesite/order-simulator-woocommerce.git",
   "author": "Parker Mathewson <theritesites@gmail.com>",
   "license": "GPL-2.0",
+	"files": [
+		"fakenames.sql",
+		"woocommerce-order-simulator.php",
+		"README.txt",
+		"README.md"
+	],
   "scripts": {
-    "start": "webpack --mode=development --env development --watch",
-    "build": "webpack --mode=production --env production",
-    "start-m": "wp-scripts build --mode=development --env.NODE_ENV=development --env.LOC=m --watch",
-    "build-m": "wp-scripts build --mode=production --env.NODE_ENV=production --env.LOC=m",
-    "start-c": "wp-scripts build --mode=development --env.NODE_ENV=development --env.LOC=c --watch",
-    "build-c": "wp-scripts build --mode=production --env.NODE_ENV=production --env.LOC=c",
-    "start-m1": "wp-scripts build --mode=development --env.NODE_ENV=development --env.LOC=m1 --watch",
-    "build-m1": "wp-scripts build --mode=production --env.NODE_ENV=production --env.LOC=m1"
+    "start-m": "wp-scripts build --mode=development --env NODE_ENV=development --env LOC=m --watch",
+    "build-m": "wp-scripts build --mode=production --env NODE_ENV=production --env LOC=m",
+    "start-c": "wp-scripts build --mode=development --env NODE_ENV=development --env LOC=c --watch",
+    "build-c": "wp-scripts build --mode=production --env NODE_ENV=production --env LOC=c",
+    "start-m1": "wp-scripts build --mode=development --env NODE_ENV=development --env LOC=m1 --watch",
+    "build-m1": "wp-scripts build --mode=production --env NODE_ENV=production --env LOC=m1",
+    "plugin-zip": "wp-scripts plugin-zip"
   },
-  "devDependencies": {
-    "babel-core": "^6.2.1",
-    "babel-loader": "^7.1.5",
-    "babel-preset-env": "^1.7.0",
-    "babel-preset-react": "^6.1.18",
-    "browser-sync": "^2.24.6",
-    "browser-sync-webpack-plugin": "^2.2.2",
-    "copy-webpack-plugin": "6.4",
-    "css-loader": "^1.0.0",
-    "mini-css-extract-plugin": "^0.4.1",
-    "style-loader": "^0.22.1",
-    "webpack": "^4.46.0",
-    "webpack-cli": "^3.1.0",
-    "webpack-dev-server": "^3.11.2",
-    "webpack-zip-plugin": "^0.1.6"
-  },
-  "dependencies": {
-    "@wordpress/scripts": "^7.2.0"
-  }
+	"devDependencies": {
+		"@wordpress/scripts": "^27",
+		"copy-webpack-plugin": "^12.0.2",
+		"webpack-cli": "^4.10.0"
+	}
 }
