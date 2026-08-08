@@ -3,30 +3,119 @@
   * Plugin Name: Order Simulator for WooCommerce
   * Plugin URI: http://www.75nineteen.com
   * Description: Automate orders to generate WooCommerce storefronts at scale for testing purposes.
-  * Version: 1.1.1
+  * Version: 1.2.0
   * Author: 75nineteen Media LLC
   * Author URI: http://www.75nineteen.com
 
   * Copyright 2015 75nineteen Media LLC.  (email : scott@75nineteen.com)
-  * 
+  *
   * This program is free software: you can redistribute it and/or modify
   * it under the terms of the GNU General Public License as published by
   * the Free Software Foundation, either version 3 of the License, or
   * (at your option) any later version.
-  * 
+  *
   * This program is distributed in the hope that it will be useful,
   * but WITHOUT ANY WARRANTY; without even the implied warranty of
   * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   * GNU General Public License for more details.
-  * 
+  *
   * You should have received a copy of the GNU General Public License
   * along with this program.  If not, see <http://www.gnu.org/licenses/>.
   */
 
+/**
+ * DATA REALISM - what 1.2.0 changed and why.
+ *
+ * See order-simulator-data-realism.md (todos/pitch-midnight/ in the parker-context
+ * repo) for the defect report this release answers. Two independent defects:
+ *
+ * 1. NO SURNAME DIVERSITY. Commit 708d383 (2020-02-06, "Updated fake names to be
+ *    all example ridden") scrubbed the fixture so nothing in it could be mistaken
+ *    for reachable contact data - emails to @example.com, phones to 555. The sweep
+ *    also overwrote the `surname` column with the literal string "Example",
+ *    collapsing 4,308 distinct surnames to 1. That was collateral damage, not the
+ *    point of the scrub: a surname is not contact data. 1.2.0 restores the surname
+ *    column and leaves the email and phone scrub in place, which is the intent the
+ *    2020 commit was actually reaching for.
+ *
+ * 2. ORDERS BUILT FROM A FAILED USER. create_user() never checked
+ *    wp_insert_user()'s return. As the 10,000-row fixture saturated, inserts began
+ *    failing on duplicate email - the uniqueness pre-check only looked at
+ *    user_login - and returned a WP_Error. That WP_Error went straight into
+ *    get_user_meta(), which answers '' for every key, so the order was written with
+ *    every address field blank. On sandbox.theritesites.com that is 18,289 of
+ *    54,484 orders (33.6%), billing and shipping alike. 1.2.0 checks the return,
+ *    and never writes an order it cannot give a real address to.
+ *
+ * The saturation itself is fixed by decoupling: given name and surname are now
+ * drawn independently rather than read off one fixture row, so the identity space
+ * is 1,340 x 4,308 rather than 10,000, and the pool cannot run dry.
+ *
+ * HPOS. The sandbox runs HPOS authoritative. The old code wrote order fields with
+ * update_post_meta(), which under HPOS addresses the legacy post rather than the
+ * orders table. Order writes now go through the CRUD layer.
+ *
+ * Verify with `wp wcos verify`, which measures the acceptance criteria from the
+ * defect report directly.
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+    exit;
+}
+
 class WC_Order_Simulator {
 
-    private $users   = array();
-    public $settings = array();
+    /**
+     * Fixture table name.
+     *
+     * Deliberately unprefixed - it has been unprefixed since 2015 and renaming it
+     * would orphan the seeded data on every existing install. The cost is that a
+     * multisite network, or several sites sharing one database, share one fixture
+     * table. That is harmless here (the table is a read-only corpus, regenerable
+     * from fakenames.sql) but it is the reason this constant exists rather than the
+     * name being repeated inline.
+     */
+    const FAKENAMES_TABLE = 'fakenames';
+
+    /**
+     * Bumping this reseeds the fixture table on the next load.
+     */
+    const FAKENAMES_VERSION = 2;
+
+    /** Mutex for the reseed. @see acquire_seed_lock() */
+    const SEED_LOCK_OPTION = 'wcos_seed_lock';
+
+    /**
+     * Exponent applied to each surname's fixture frequency before drawing.
+     *
+     * The fixture's own frequencies are close to flat: the most common surname is
+     * 0.47% of rows, so every search term ends up about as selective as every
+     * other one and an index is never asked a hard question. Raising the counts to
+     * this power sharpens the curve toward the long tail real surname data has.
+     *
+     * At 1.5 the most common surname lands at 1.11% - inside the 1-2% the defect
+     * report asks for - while a 50,000-order run still expects ~3,777 distinct
+     * surnames against a floor of 2,000, and 2,924 surnames stay rare enough to
+     * appear fewer than three times. Higher exponents buy a steeper head at the
+     * cost of the tail: 2.2 reaches 2.00% but drops expected distinct surnames to
+     * 1,594, which fails the floor. Filterable via wcos_surname_frequency_exponent.
+     */
+    const SURNAME_FREQUENCY_EXPONENT = 1.5;
+
+    /**
+     * Domain for generated addresses. Reserved by RFC 2606 - never deliverable.
+     */
+    const EMAIL_DOMAIN = 'example.com';
+
+    private $users        = array();
+    private $users_loaded = false;
+    public $settings      = array();
+
+    /** Lazily built name corpora. @see load_name_corpora() */
+    private $given_pool    = null;
+    private $surname_names = null;
+    private $surname_cdf   = null;
+    private $surname_total = 0.0;
 
     public function __construct() {
         register_activation_hook( __FILE__, array($this, 'install') );
@@ -38,9 +127,15 @@ class WC_Order_Simulator {
         add_action( 'wcos_create_orders', array($this, 'create_orders_on_init') );
         $this->settings = self::get_settings();
 
+        // Existing installs carry a stale fixture. Activation already happened for
+        // them, so the reseed cannot hang off register_activation_hook alone.
+        add_action( 'plugins_loaded', array($this, 'maybe_reseed_fakenames') );
 
         add_action( 'woocommerce_order_status_completed', array( $this, 'trs_add_costs' ) );
 
+        if ( defined( 'WP_CLI' ) && WP_CLI ) {
+            WP_CLI::add_command( 'wcos', 'WCOS_CLI_Command' );
+        }
     }
 
     public function add_cron_schedule( $schedules ) {
@@ -75,7 +170,9 @@ class WC_Order_Simulator {
 
         require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
 
-        $sql = "CREATE TABLE fakenames (
+        $table = self::FAKENAMES_TABLE;
+
+        $sql = "CREATE TABLE {$table} (
 number int(11) NOT NULL AUTO_INCREMENT,
 gender varchar(6) NOT NULL,
 givenname varchar(20) NOT NULL,
@@ -97,14 +194,127 @@ PRIMARY KEY  (number)
 ) $collate";
         dbDelta( $sql );
 
-        $count = $wpdb->get_var("SELECT COUNT(*) FROM fakenames");
+        $this->seed_fakenames();
+    }
 
-        if ( $count == 0 ) {
-            $lines = explode( "\n", file_get_contents( dirname(__FILE__) .'/fakenames.sql' ) );
-
-            foreach ( $lines as $sql )
-                $wpdb->query($sql);
+    /**
+     * Reload the fixture when the shipped data is newer than what is in the table.
+     *
+     * Cheap in the common case: one autoloaded option read.
+     */
+    public function maybe_reseed_fakenames() {
+        if ( (int) get_option( 'wcos_fakenames_version', 0 ) >= self::FAKENAMES_VERSION ) {
+            return;
         }
+
+        global $wpdb;
+        $table = self::FAKENAMES_TABLE;
+
+        // Nothing to reseed if the table was never created; activation handles that.
+        if ( $wpdb->get_var( "SHOW TABLES LIKE '{$table}'" ) !== $table ) {
+            return;
+        }
+
+        // Whichever request notices the stale version first does the work. Without
+        // this, concurrent requests each truncate and reload 10,000 rows, and a
+        // reader between one request's TRUNCATE and its INSERTs sees an empty
+        // corpus.
+        if ( ! $this->acquire_seed_lock() ) {
+            return;
+        }
+
+        $this->seed_fakenames( true );
+
+        $this->release_seed_lock();
+    }
+
+    /**
+     * Claim the right to reseed, using an option row as the mutex.
+     *
+     * add_option() fails when the row already exists, and that failure is atomic at
+     * the database level - which a get-then-set on a transient is not. A lock older
+     * than five minutes is treated as abandoned, so a seed that fatals partway
+     * through does not block the reseed forever.
+     */
+    private function acquire_seed_lock() {
+        if ( add_option( self::SEED_LOCK_OPTION, time(), '', 'no' ) ) {
+            return true;
+        }
+
+        $held_since = (int) get_option( self::SEED_LOCK_OPTION, 0 );
+
+        if ( $held_since && ( time() - $held_since ) > 5 * MINUTE_IN_SECONDS ) {
+            update_option( self::SEED_LOCK_OPTION, time(), 'no' );
+            return true;
+        }
+
+        return false;
+    }
+
+    private function release_seed_lock() {
+        delete_option( self::SEED_LOCK_OPTION );
+    }
+
+    /**
+     * Load fakenames.sql into the fixture table.
+     *
+     * @param bool $force Truncate and reload even when the table already has rows.
+     */
+    public function seed_fakenames( $force = false ) {
+        global $wpdb;
+
+        $table = self::FAKENAMES_TABLE;
+        $count = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table}" );
+
+        if ( $count > 0 && ! $force ) {
+            update_option( 'wcos_fakenames_version', self::FAKENAMES_VERSION );
+            return $count;
+        }
+
+        $path = dirname( __FILE__ ) . '/fakenames.sql';
+        $fh   = @fopen( $path, 'r' );
+
+        if ( ! $fh ) {
+            return new WP_Error( 'wcos_fixture_missing', sprintf( 'Cannot read %s', $path ) );
+        }
+
+        if ( $count > 0 ) {
+            $wpdb->query( "TRUNCATE TABLE {$table}" );
+        }
+
+        $loaded = 0;
+        $first  = true;
+
+        // Streamed rather than file_get_contents()+explode(): the fixture is 2.3MB
+        // and the old approach held the file and a 10,000-element array at once.
+        while ( false !== ( $line = fgets( $fh ) ) ) {
+            if ( $first ) {
+                // The file used to carry a UTF-8 BOM, which glued itself to the
+                // first INSERT and made that one statement fail silently - which is
+                // why a 10,000-row fixture only ever had 9,999 rows in it.
+                $line  = preg_replace( '/^\xEF\xBB\xBF/', '', $line );
+                $first = false;
+            }
+
+            $line = trim( $line );
+
+            if ( '' === $line || 0 !== stripos( $line, 'insert into ' . $table ) ) {
+                continue;
+            }
+
+            if ( false !== $wpdb->query( $line ) ) {
+                $loaded++;
+            }
+        }
+
+        fclose( $fh );
+
+        update_option( 'wcos_fakenames_version', self::FAKENAMES_VERSION );
+
+        // A corpus loaded in a previous request is stale now.
+        $this->given_pool = null;
+
+        return $loaded;
     }
 
     public function settings_page( $settings ) {
@@ -136,6 +346,331 @@ PRIMARY KEY  (number)
 
         return $settings;
     }
+
+    /* ---------------------------------------------------------------------
+     * Identity generation
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Build the given-name and surname corpora from the fixture table.
+     *
+     * Given names are held as a flat pool with repeats, so drawing uniformly from
+     * it reproduces the fixture's own given-name frequencies for free. Surnames get
+     * a cumulative distribution instead, because their weights are reshaped by
+     * SURNAME_FREQUENCY_EXPONENT before drawing.
+     *
+     * Drawing the two independently is the point: reading both off one fixture row
+     * caps the store at 10,000 identities and, worse, ties the surname you get to
+     * the address you get. Independent draws give 1,340 x 4,308 combinations.
+     */
+    private function load_name_corpora() {
+        if ( null !== $this->given_pool ) {
+            return;
+        }
+
+        global $wpdb;
+        $table = self::FAKENAMES_TABLE;
+
+        $this->given_pool = $wpdb->get_col(
+            "SELECT givenname FROM {$table} WHERE givenname <> ''"
+        );
+
+        $rows = $wpdb->get_results(
+            "SELECT surname, COUNT(*) AS c FROM {$table} WHERE surname <> '' GROUP BY surname"
+        );
+
+        $exponent = (float) apply_filters(
+            'wcos_surname_frequency_exponent',
+            self::SURNAME_FREQUENCY_EXPONENT
+        );
+
+        $names = array();
+        $cdf   = array();
+        $acc   = 0.0;
+
+        foreach ( (array) $rows as $row ) {
+            $acc    += pow( (float) $row->c, $exponent );
+            $names[] = $row->surname;
+            $cdf[]   = $acc;
+        }
+
+        $this->surname_names = $names;
+        $this->surname_cdf   = $cdf;
+        $this->surname_total = $acc;
+    }
+
+    /**
+     * Draw a surname, weighted so the distribution has a head and a long tail.
+     */
+    private function pick_surname() {
+        if ( empty( $this->surname_cdf ) ) {
+            return '';
+        }
+
+        $target = ( mt_rand() / mt_getrandmax() ) * $this->surname_total;
+
+        $lo = 0;
+        $hi = count( $this->surname_cdf ) - 1;
+
+        while ( $lo < $hi ) {
+            $mid = intdiv( $lo + $hi, 2 );
+            if ( $this->surname_cdf[ $mid ] < $target ) {
+                $lo = $mid + 1;
+            } else {
+                $hi = $mid;
+            }
+        }
+
+        return $this->surname_names[ $lo ];
+    }
+
+    /**
+     * Reduce a name to something usable in a login and an email local part.
+     */
+    private function ascii_slug( $value ) {
+        $value = remove_accents( (string) $value );
+        return strtolower( preg_replace( '/[^A-Za-z0-9]/', '', $value ) );
+    }
+
+    /**
+     * Compose an unused synthetic identity.
+     *
+     * The email is derived from the name rather than drawn separately, so that
+     * searching a customer by surname and searching them by email select the same
+     * orders. When those two generators are unrelated - as they were before 1.2.0 -
+     * a search feature can get one of them wrong and still look correct.
+     *
+     * @return array|WP_Error given, surname, login, email
+     */
+    private function generate_identity() {
+        $this->load_name_corpora();
+
+        if ( empty( $this->given_pool ) || empty( $this->surname_names ) ) {
+            return new WP_Error(
+                'wcos_empty_corpus',
+                'The fakenames fixture is empty. Reactivate Order Simulator, or run `wp wcos seed --force`, to load it.'
+            );
+        }
+
+        $given_count = count( $this->given_pool );
+
+        for ( $attempt = 0; $attempt < 10; $attempt++ ) {
+            $given   = $this->given_pool[ mt_rand( 0, $given_count - 1 ) ];
+            $surname = $this->pick_surname();
+
+            $slug_given   = $this->ascii_slug( $given );
+            $slug_surname = $this->ascii_slug( $surname );
+
+            if ( '' === $slug_given || '' === $slug_surname ) {
+                continue;
+            }
+
+            $login = $slug_given . '.' . $slug_surname . mt_rand( 100, 99999 );
+            $email = $login . '@' . self::EMAIL_DOMAIN;
+
+            // Both checks, not just the login one. Checking only user_login is the
+            // bug that made wp_insert_user() fail on duplicate email once the
+            // fixture saturated, which is where the blank orders came from.
+            if ( username_exists( $login ) || email_exists( $email ) ) {
+                continue;
+            }
+
+            return array(
+                'given'   => $given,
+                'surname' => $surname,
+                'login'   => $login,
+                'email'   => $email,
+            );
+        }
+
+        return new WP_Error( 'wcos_identity_collision', 'Could not compose an unused identity in 10 attempts.' );
+    }
+
+    /**
+     * Draw a random street address from the fixture.
+     *
+     * Uses the primary key rather than ORDER BY RAND(), which sorts the whole table
+     * on every call.
+     */
+    private function random_address_row() {
+        global $wpdb;
+        $table = self::FAKENAMES_TABLE;
+
+        $max = (int) $wpdb->get_var( "SELECT MAX(number) FROM {$table}" );
+
+        if ( $max < 1 ) {
+            return null;
+        }
+
+        return $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM {$table} WHERE number >= %d ORDER BY number LIMIT 1",
+            mt_rand( 1, $max )
+        ) );
+    }
+
+    /**
+     * Write billing and shipping meta for a user from an identity and an address.
+     */
+    private function write_address_meta( $user_id, $identity, $address ) {
+        $fields = array(
+            'first_name' => $identity['given'],
+            'last_name'  => $identity['surname'],
+            'address_1'  => $address->streetaddress,
+            'city'       => $address->city,
+            'state'      => $address->state,
+            'postcode'   => $address->zipcode,
+            'country'    => $address->country,
+            'email'      => $identity['email'],
+            'phone'      => $address->telephonenumber,
+        );
+
+        foreach ( array( 'billing', 'shipping' ) as $type ) {
+            foreach ( $fields as $key => $value ) {
+                update_user_meta( $user_id, $type . '_' . $key, $value );
+            }
+        }
+    }
+
+    /**
+     * Create a customer account with a synthetic identity.
+     *
+     * @return int|WP_Error
+     */
+    public function create_user() {
+        $identity = $this->generate_identity();
+
+        if ( is_wp_error( $identity ) ) {
+            return $identity;
+        }
+
+        $address = $this->random_address_row();
+
+        if ( ! $address ) {
+            return new WP_Error( 'wcos_no_address', 'The fakenames fixture has no address rows.' );
+        }
+
+        $user_id = wp_insert_user( array(
+            'user_login' => $identity['login'],
+            'user_pass'  => wp_generate_password( 24 ),
+            'user_email' => $identity['email'],
+            'first_name' => $identity['given'],
+            'last_name'  => $identity['surname'],
+            'role'       => 'customer',
+        ) );
+
+        // The check that was missing. Without it a WP_Error flows into
+        // get_user_meta(), which answers '' for every key, and the order is written
+        // with a completely blank address.
+        if ( is_wp_error( $user_id ) ) {
+            return $user_id;
+        }
+
+        $this->write_address_meta( $user_id, $identity, $address );
+
+        // Keep the reuse pool current so new accounts can be drawn again this run.
+        if ( $this->users_loaded ) {
+            $this->users[] = $user_id;
+        }
+
+        return $user_id;
+    }
+
+    /**
+     * Pick an existing customer, or 0 when there are none.
+     *
+     * Returned 0 or null out of an empty pool before 1.2.0 - rand(0, -1) on an
+     * empty array - which produced the same blank-address order as a failed insert.
+     */
+    public function get_random_user() {
+        // Tracked with a flag rather than by emptiness: on a store with no
+        // customers yet, testing the array itself re-runs the query every call and
+        // never lets newly created accounts into the pool.
+        if ( ! $this->users_loaded ) {
+            $this->users        = get_users( array( 'role' => 'Customer', 'fields' => 'ID' ) );
+            $this->users_loaded = true;
+        }
+
+        $length = count( $this->users );
+
+        if ( $length < 1 ) {
+            return 0;
+        }
+
+        return (int) $this->users[ mt_rand( 0, $length - 1 ) ];
+    }
+
+    /**
+     * Repair a customer whose address meta is empty.
+     *
+     * Narrow on purpose: it fires only when billing_last_name is blank, and it
+     * leaves the account's own email alone so the login keeps working. Customers
+     * that merely carry a stale name are left as they are - use
+     * `wp wcos refresh-customers` to re-identify those deliberately.
+     *
+     * @return bool Whether the user now has usable address meta.
+     */
+    private function ensure_address_meta( $user_id ) {
+        if ( '' !== trim( (string) get_user_meta( $user_id, 'billing_last_name', true ) ) ) {
+            return true;
+        }
+
+        $identity = $this->generate_identity();
+
+        if ( is_wp_error( $identity ) ) {
+            return false;
+        }
+
+        $address = $this->random_address_row();
+
+        if ( ! $address ) {
+            return false;
+        }
+
+        $user = get_userdata( $user_id );
+
+        if ( $user && $user->user_email ) {
+            $identity['email'] = $user->user_email;
+        }
+
+        $this->write_address_meta( $user_id, $identity, $address );
+
+        return true;
+    }
+
+    /**
+     * Resolve a usable customer for one order.
+     *
+     * @return int Customer ID, or 0 when no usable customer could be produced.
+     */
+    private function resolve_customer() {
+        if ( ! $this->settings['create_users'] ) {
+            // "No - assign existing accounts to new orders". Creating one anyway
+            // would quietly overrule the setting.
+            $candidates = array( 'get_random_user' );
+        } elseif ( mt_rand( 1, 100 ) <= 50 ) {
+            $candidates = array( 'create_user', 'get_random_user' );
+        } else {
+            $candidates = array( 'get_random_user', 'create_user' );
+        }
+
+        foreach ( $candidates as $method ) {
+            $user_id = $this->$method();
+
+            if ( is_wp_error( $user_id ) || ! $user_id ) {
+                continue;
+            }
+
+            if ( $this->ensure_address_meta( $user_id ) ) {
+                return (int) $user_id;
+            }
+        }
+
+        return 0;
+    }
+
+    /* ---------------------------------------------------------------------
+     * Order generation
+     * ------------------------------------------------------------------ */
 
     public function create_orders() {
         global $wpdb, $woocommerce;
@@ -178,19 +713,31 @@ PRIMARY KEY  (number)
             }
         }
 
-        for ( $x = 0; $x < $this->settings['orders_per_hour']; $x++ ) {
-            $cart           = array();
-            $num_products   = rand( $this->settings['min_order_products'], $this->settings['max_order_products'] );
-            $create_user    = false;
+        if ( empty( $product_ids ) ) {
+            return;
+        }
 
-            if ( $this->settings['create_users'] ) {
-                $create_user = ( rand( 1, 100 ) <= 50 ) ? true : false;
+        $skipped = 0;
+
+        for ( $x = 0; $x < $this->settings['orders_per_hour']; $x++ ) {
+            $num_products = rand( $this->settings['min_order_products'], $this->settings['max_order_products'] );
+
+            $user_id = $this->resolve_customer();
+
+            // Skip rather than write an order nobody can be found by. A blank
+            // address passes any test that only asks "did the search return
+            // something", which is how 18,289 unusable orders got onto the sandbox
+            // without anyone noticing.
+            if ( ! $user_id ) {
+                $skipped++;
+                continue;
             }
 
-            if ( $create_user ) {
-                $user_id = self::create_user();
-            } else {
-                $user_id = self::get_random_user();
+            $data = $this->checkout_data_for_user( $user_id );
+
+            if ( ! $data ) {
+                $skipped++;
+                continue;
             }
 
             // add random products to cart
@@ -200,56 +747,29 @@ PRIMARY KEY  (number)
                 $woocommerce->cart->add_to_cart( $product_id, 1 );
             }
 
-            // process checkout
-            $data = array(
-                'billing_country'   => get_user_meta( $user_id, 'billing_country', true ),
-                'billing_first_name'=> get_user_meta( $user_id, 'billing_first_name', true ),
-                'billing_last_name' => get_user_meta( $user_id, 'billing_last_name', true ),
-                'billing_company'   => '',
-                'billing_address_1' => get_user_meta( $user_id, 'billing_address_1', true ),
-                'billing_address_2' => '',
-                'billing_city'      => get_user_meta( $user_id, 'billing_city', true ),
-                'billing_state'     => get_user_meta( $user_id, 'billing_state', true ),
-                'billing_postcode'  => get_user_meta( $user_id, 'billing_postcode', true ),
-                'billing_email'     => get_user_meta( $user_id, 'billing_email', true ),
-                'billing_phone'     => get_user_meta( $user_id, 'billing_phone', true ),
-
-                'shipping_country'   => get_user_meta( $user_id, 'shipping_country', true ),
-                'shipping_first_name'=> get_user_meta( $user_id, 'shipping_first_name', true ),
-                'shipping_last_name' => get_user_meta( $user_id, 'shipping_last_name', true ),
-                'shipping_company'   => '',
-                'shipping_address_1' => get_user_meta( $user_id, 'shipping_address_1', true ),
-                'shipping_address_2' => '',
-                'shipping_city'      => get_user_meta( $user_id, 'shipping_city', true ),
-                'shipping_state'     => get_user_meta( $user_id, 'shipping_state', true ),
-                'shipping_postcode'  => get_user_meta( $user_id, 'shipping_postcode', true ),
-                'shipping_email'     => get_user_meta( $user_id, 'shipping_email', true ),
-                'shipping_phone'     => get_user_meta( $user_id, 'shipping_phone', true )
-            );
             $checkout = new WC_Checkout();
 
             $woocommerce->cart->calculate_totals();
 
             $order_id = $checkout->create_order( $data );
 
-            if ( $order_id ) {
-                update_post_meta( $order_id, '_payment_method', 'bacs' );
-                update_post_meta( $order_id, '_payment_method_title', 'Bacs' );
+            if ( $order_id && ! is_wp_error( $order_id ) ) {
+                $order = wc_get_order( $order_id );
+            } else {
+                $order = false;
+            }
 
-                // update_post_meta( $order_id, '_shipping_method', 'free_shipping' );
-                // update_post_meta( $order_id, '_shipping_method_title', 'Free Shipping' );
-                update_post_meta( $order_id, '_shipping_method', 'flat_rate' );
-                update_post_meta( $order_id, '_shipping_method_title', 'Flat Rate' );
+            if ( $order ) {
+                // CRUD rather than update_post_meta(). Under HPOS the orders table
+                // is authoritative and post meta is at best a synced copy, so the
+                // old update_post_meta() calls wrote to the wrong place - including
+                // _customer_user, which is how an order is found by its customer.
+                $order->set_address( $this->address_subset( $data, 'billing' ), 'billing' );
+                $order->set_address( $this->address_subset( $data, 'shipping' ), 'shipping' );
 
-                update_post_meta( $order_id, '_customer_user', absint( $user_id ) );
-
-                foreach ( $data as $key => $value ) {
-                    update_post_meta( $order_id, '_'.$key, $value );
-                }
-
-                do_action( 'woocommerce_checkout_order_processed', $order_id, $data );
-
-                $order = new WC_Order($order_id);
+                $order->set_customer_id( absint( $user_id ) );
+                $order->set_payment_method( 'bacs' );
+                $order->set_payment_method_title( 'BACS' );
 
                 $country_code = $order->get_shipping_country();
 
@@ -275,6 +795,9 @@ PRIMARY KEY  (number)
 				$order->add_item( $item );
 
 				$order->calculate_totals();
+				$order->save();
+
+                do_action( 'woocommerce_checkout_order_processed', $order_id, $data, $order );
 
                 // figure out the order status
                 $status = 'completed';
@@ -302,72 +825,72 @@ PRIMARY KEY  (number)
             // clear cart
             $woocommerce->cart->empty_cart();
         }
+
+        if ( $skipped ) {
+            error_log( sprintf(
+                '[order-simulator] skipped %d of %d orders: no customer with a usable address.',
+                $skipped,
+                $this->settings['orders_per_hour']
+            ) );
+        }
     }
 
-    public function create_user() {
-        global $wpdb;
-
-        $user_id = 0;
-
-        do {
-            $user_row = $wpdb->get_row("SELECT * FROM fakenames ORDER BY RAND() LIMIT 1");
-
-            $count = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}users WHERE user_login = '{$user_row->username}'");
-
-            $unique = ($count == 0) ? true : false;
-        } while (! $unique);
-
-
-        $user = array(
-            'user_login'    => $user_row->username,
-            'user_pass'     => '75nineteen',
-            'user_email'    => $user_row->emailaddress,
-            'first_name'    => $user_row->givenname,
-            'last_name'     => $user_row->surname,
-            'role'          => 'customer'
+    /**
+     * Build checkout data from a customer, or false when a field is missing.
+     *
+     * The emptiness check is the guard rail. Every field here is one a lookup
+     * feature might be asked to search on, so an order missing any of them is a
+     * fixture that cannot fail the way production fails.
+     *
+     * @return array|false
+     */
+    private function checkout_data_for_user( $user_id ) {
+        $keys = array(
+            'country', 'first_name', 'last_name', 'company', 'address_1',
+            'address_2', 'city', 'state', 'postcode', 'email', 'phone',
         );
 
-        $user_id = wp_insert_user( $user );
+        $data = array();
 
-        // billing/shipping address
-        $meta = array(
-            'billing_country'       => $user_row->country,
-            'billing_first_name'    => $user_row->givenname,
-            'billing_last_name'     => $user_row->surname,
-            'billing_address_1'     => $user_row->streetaddress,
-            'billing_city'          => $user_row->city,
-            'billing_state'         => $user_row->state,
-            'billing_postcode'      => $user_row->zipcode,
-            'billing_email'         => $user_row->emailaddress,
-            'billing_phone'         => $user_row->telephonenumber,
-            'shipping_country'      => $user_row->country,
-            'shipping_first_name'   => $user_row->givenname,
-            'shipping_last_name'    => $user_row->surname,
-            'shipping_address_1'    => $user_row->streetaddress,
-            'shipping_city'         => $user_row->city,
-            'shipping_state'        => $user_row->state,
-            'shipping_postcode'     => $user_row->zipcode,
-            'shipping_email'        => $user_row->emailaddress,
-            'shipping_phone'        => $user_row->telephonenumber
-        );
+        foreach ( array( 'billing', 'shipping' ) as $type ) {
+            foreach ( $keys as $key ) {
+                $meta_key = $type . '_' . $key;
 
-        foreach ($meta as $key => $value) {
-            update_user_meta( $user_id, $key, $value );
+                $data[ $meta_key ] = in_array( $key, array( 'company', 'address_2' ), true )
+                    ? ''
+                    : (string) get_user_meta( $user_id, $meta_key, true );
+            }
         }
 
-        return $user_id;
+        $required = array(
+            'first_name', 'last_name', 'address_1', 'city', 'postcode', 'country', 'email',
+        );
+
+        foreach ( array( 'billing', 'shipping' ) as $type ) {
+            foreach ( $required as $key ) {
+                if ( '' === trim( $data[ $type . '_' . $key ] ) ) {
+                    return false;
+                }
+            }
+        }
+
+        return $data;
     }
 
-    public function get_random_user() {
-        if ( !$this->users ) {
-            // $this->users  = get_users( array('role' => 'Subscriber', 'fields' => 'ID') );
-            $this->users  = get_users( array('role' => 'Customer', 'fields' => 'ID') );
+    /**
+     * Strip the billing_/shipping_ prefix for WC_Order::set_address().
+     */
+    private function address_subset( $data, $type ) {
+        $out    = array();
+        $prefix = $type . '_';
+
+        foreach ( $data as $key => $value ) {
+            if ( 0 === strpos( $key, $prefix ) ) {
+                $out[ substr( $key, strlen( $prefix ) ) ] = $value;
+            }
         }
 
-        $length = count($this->users);
-        $idx    = rand(0, $length-1);
-
-        return $this->users[$idx];
+        return $out;
     }
 
     public function trs_add_costs( $order_id ) {
@@ -383,74 +906,78 @@ PRIMARY KEY  (number)
 				$current_key = trim( $cost_meta_key );
 
 				if ( isset( $costs_meta_extensions[$current_key]->category ) ) {
-					if ( false !== ( $found_index = array_search( $costs_meta_extensions[$current_key]->category, array_keys( $default_cost_categories ) ) ) ) {
-                        // error_log( 'seems like the cost plugin is set?');
-						$default_cost_categories[$costs_meta_extensions[$current_key]->category] = $costs_meta_extensions[$current_key]->key;
-					} else {
-                        // error_log( 'sus else');
-                        $default_cost_categories[$costs_meta_extensions[$current_key]->category] = $costs_meta_extensions[$current_key]->key;
-                    }
+					$default_cost_categories[$costs_meta_extensions[$current_key]->category] = $costs_meta_extensions[$current_key]->key;
 				}
 			}
 		}
 
-        foreach( $default_cost_categories as $cost_category => $cost_key ) {
-            // error_log(wc_print_r(array($cost_category => $cost_key), true));
-            $order = wc_get_order( $order_id );
-            $stored_cog = '';
-            if( ! empty( $order ) ) {
-                $total = (float)$order->get_total();
-                if ( $cost_category === 'cost_of_shipping' ) {
-                    $first = mt_rand( 2, 6 );
-                    $second = mt_rand( 0, 99 ) / 100;
-                    $order->update_meta_data( $cost_key, ( $total / $first ) + $second );
-                    if ( $cost_key === '_wc_cost_of_shipping' ) {
-                        $method = mt_rand( 1, 3 );
-                        $third = 'manual';
-                        switch ($method ) {
-                            case 1:
-                                $third = 'wc-services';
-                            break;
-                            case 2:
-                                $third = 'shipstation';
-                            break;
-                            case 3:
-                            default:
-                                $third = 'manual';
-                            break;
-                        }
-                        $order->update_meta_data( '_wc_cos_method', $third );
-                    }
-                }
-                // error_log("b4storing to aoc");
-                if ( $cost_category === 'additional_costs' ) {
-                    $loop = mt_rand( 1,5 );
-                    $val = array();
-                    for ( $i = 0; $i < $loop; $i++ ) {
-                        
-                        $first = mt_rand( 1, 5 );
-                        $second = mt_rand( 0, 99 ) / 100;
-                        array_push( $val, (object)array( 'label' => 'arg ' . $first, 'cost' => floatval( $first + $second ) ) );
-                    }
-                    $order->update_meta_data( $cost_key, json_encode($val) ); 
-                }
-                if ( $cost_category === 'cost_of_goods' ) {
-                    if ( ( $stored_cog = get_post_meta( $order_id, $cost_key, true ) ) && ( empty( $stored_cog ) || intval( $stored_cog ) <= 0 ) ) {
-                        $first = mt_rand( 3, 7 );
-                        $second = mt_rand( 0, 3 );
-                        $third = floatval( $total / $first ) + ( 0.25 * $second );
-                        $order->update_meta_data( $cost_key, floatval( $third ) ); 
-                    }
-                }
-            }
-            $order->save();
+        if ( empty( $default_cost_categories ) ) {
+            return;
         }
 
+        $order = wc_get_order( $order_id );
+
+        // wc_get_order() returns false for a deleted or invalid order, and the old
+        // code called ->save() on it unconditionally at the end of every iteration.
+        if ( ! $order ) {
+            return;
+        }
+
+        $total = (float) $order->get_total();
+
+        foreach( $default_cost_categories as $cost_category => $cost_key ) {
+            if ( $cost_category === 'cost_of_shipping' ) {
+                $first = mt_rand( 2, 6 );
+                $second = mt_rand( 0, 99 ) / 100;
+                $order->update_meta_data( $cost_key, ( $total / $first ) + $second );
+                if ( $cost_key === '_wc_cost_of_shipping' ) {
+                    $method = mt_rand( 1, 3 );
+                    $third = 'manual';
+                    switch ($method ) {
+                        case 1:
+                            $third = 'wc-services';
+                        break;
+                        case 2:
+                            $third = 'shipstation';
+                        break;
+                        case 3:
+                        default:
+                            $third = 'manual';
+                        break;
+                    }
+                    $order->update_meta_data( '_wc_cos_method', $third );
+                }
+            }
+            if ( $cost_category === 'additional_costs' ) {
+                $loop = mt_rand( 1,5 );
+                $val = array();
+                for ( $i = 0; $i < $loop; $i++ ) {
+
+                    $first = mt_rand( 1, 5 );
+                    $second = mt_rand( 0, 99 ) / 100;
+                    array_push( $val, (object)array( 'label' => 'arg ' . $first, 'cost' => floatval( $first + $second ) ) );
+                }
+                $order->update_meta_data( $cost_key, json_encode($val) );
+            }
+            if ( $cost_category === 'cost_of_goods' ) {
+                // get_post_meta() reads the legacy post, which under HPOS is not
+                // where this order's meta lives.
+                $stored_cog = $order->get_meta( $cost_key, true );
+
+                if ( empty( $stored_cog ) || floatval( $stored_cog ) <= 0 ) {
+                    $first = mt_rand( 3, 7 );
+                    $second = mt_rand( 0, 3 );
+                    $third = floatval( $total / $first ) + ( 0.25 * $second );
+                    $order->update_meta_data( $cost_key, floatval( $third ) );
+                }
+            }
+        }
+
+        $order->save();
     }
+
     public function trs_add_cost_of_shipping( $order_id ) {
 
-        // update_post_meta( $order_id, '_wc_cost_of_shipping', 3.67 );
-        // update_post_meta( $order_id, '_wc_cos_method', 'manual' );
         $order = wc_get_order( $order_id );
         if( ! empty( $order ) ) {
             $first = mt_rand( 2, 6 );
@@ -470,15 +997,260 @@ PRIMARY KEY  (number)
                 break;
             }
             $total = (float)$order->get_total();
-        //	$order->update_meta_data( '_wc_cost_of_shipping', $total );
-        //  $order->update_meta_data( '_wc_cost_of_shipping', ( $total / 6 ) + 0.24 );
-        //	$order->update_meta_data( '_wc_cos_method', 'manual' );
             $order->update_meta_data( '_wc_cost_of_shipping', ( $total / $first ) + $second );
             $order->update_meta_data( '_wc_cos_method', $third );
             $order->save();
         }
     }
 
+    /**
+     * Re-identify existing customers whose name meta is stale.
+     *
+     * Backs `wp wcos refresh-customers`. Deliberately not automatic: it rewrites
+     * account and address names on real user rows, and that is a decision to make
+     * on purpose rather than a side effect of a cron tick.
+     *
+     * @param string   $match_last_name Only touch customers with this billing surname.
+     * @param int      $limit           Maximum customers to touch.
+     * @param callable $progress        Called with each user ID processed.
+     *
+     * @return array updated, skipped
+     */
+    public function refresh_customer_identities( $match_last_name = '', $limit = 0, $progress = null ) {
+        $args = array( 'role' => 'Customer', 'fields' => 'ID' );
+
+        if ( '' !== $match_last_name ) {
+            $args['meta_key']   = 'billing_last_name';
+            $args['meta_value'] = $match_last_name;
+        }
+
+        if ( $limit > 0 ) {
+            $args['number'] = $limit;
+        }
+
+        $user_ids = get_users( $args );
+
+        $updated = 0;
+        $skipped = 0;
+
+        foreach ( $user_ids as $user_id ) {
+            $identity = $this->generate_identity();
+            $address  = $this->random_address_row();
+
+            if ( is_wp_error( $identity ) || ! $address ) {
+                $skipped++;
+                continue;
+            }
+
+            // The account keeps its email so the login still resolves; the address
+            // email is what a lookup feature searches, and that one is regenerated
+            // from the new name.
+            $this->write_address_meta( $user_id, $identity, $address );
+
+            update_user_meta( $user_id, 'first_name', $identity['given'] );
+            update_user_meta( $user_id, 'last_name', $identity['surname'] );
+
+            $updated++;
+
+            if ( is_callable( $progress ) ) {
+                call_user_func( $progress, $user_id );
+            }
+        }
+
+        return array( 'updated' => $updated, 'skipped' => $skipped );
+    }
+
+    /**
+     * Measure the acceptance criteria from the defect report.
+     *
+     * @return array criterion => array(label, value, target, pass)
+     */
+    public function measure_realism() {
+        global $wpdb;
+
+        $addresses = $wpdb->prefix . 'wc_order_addresses';
+
+        if ( $wpdb->get_var( "SHOW TABLES LIKE '{$addresses}'" ) !== $addresses ) {
+            return new WP_Error(
+                'wcos_no_hpos',
+                sprintf( '%s does not exist. These measurements assume HPOS.', $addresses )
+            );
+        }
+
+        $totals = $wpdb->get_row(
+            "SELECT COUNT(*)                   AS rows_total,
+                    COUNT(DISTINCT last_name)  AS distinct_last,
+                    COUNT(DISTINCT first_name) AS distinct_first,
+                    COUNT(DISTINCT email)      AS distinct_email,
+                    SUM(last_name = '')        AS empty_last,
+                    SUM(first_name = '')       AS empty_first,
+                    SUM(address_1 = '')        AS empty_address,
+                    SUM(city = '')             AS empty_city,
+                    COUNT(DISTINCT city)       AS distinct_city
+             FROM   {$addresses}"
+        );
+
+        $rows = max( 1, (int) $totals->rows_total );
+
+        $top = $wpdb->get_row(
+            "SELECT last_name, COUNT(*) AS c
+             FROM   {$addresses}
+             WHERE  last_name <> ''
+             GROUP  BY last_name
+             ORDER  BY c DESC
+             LIMIT  1"
+        );
+
+        $top_share = $top ? ( 100 * (int) $top->c / $rows ) : 0.0;
+
+        // Criterion 4: an address whose email does not contain its own surname is
+        // one where searching by name and searching by email disagree.
+        //
+        // Folded in PHP with the same ascii_slug() the generator uses, rather than
+        // with a SQL LIKE. 106 of the 4,308 surnames carry a space, hyphen or
+        // apostrophe and 206 rows carry an accent; a raw LIKE would report every
+        // Balls-Headley and every Muller as a failure when the data is correct.
+        $pairs = $wpdb->get_results(
+            "SELECT DISTINCT last_name, email
+             FROM   {$addresses}
+             WHERE  last_name <> '' AND email <> ''"
+        );
+
+        $uncorrelated = 0;
+
+        foreach ( (array) $pairs as $pair ) {
+            $surname = $this->ascii_slug( $pair->last_name );
+
+            if ( '' === $surname || false === strpos( strtolower( $pair->email ), $surname ) ) {
+                $uncorrelated++;
+            }
+        }
+
+        $empty_name_pct = 100 * max( (int) $totals->empty_last, (int) $totals->empty_first ) / $rows;
+
+        return array(
+            'rows'          => array( 'label' => 'Address rows measured', 'value' => (int) $totals->rows_total, 'target' => '-', 'pass' => null ),
+            'distinct_last' => array( 'label' => 'Distinct surnames', 'value' => (int) $totals->distinct_last, 'target' => '>= 2000', 'pass' => (int) $totals->distinct_last >= 2000 ),
+            'empty_names'   => array( 'label' => 'Rows with an empty given or family name', 'value' => sprintf( '%.2f%%', $empty_name_pct ), 'target' => '< 1%', 'pass' => $empty_name_pct < 1.0 ),
+            'top_share'     => array( 'label' => sprintf( 'Most common surname (%s)', $top ? $top->last_name : 'n/a' ), 'value' => sprintf( '%.2f%%', $top_share ), 'target' => '1-2%', 'pass' => $top_share >= 1.0 && $top_share <= 2.0 ),
+            'email_match'   => array( 'label' => 'Distinct name/email pairs where the email omits the surname', 'value' => $uncorrelated, 'target' => '0', 'pass' => 0 === $uncorrelated ),
+            'empty_address' => array( 'label' => 'Rows with an empty street address', 'value' => (int) $totals->empty_address, 'target' => '0', 'pass' => 0 === (int) $totals->empty_address ),
+            'distinct_city' => array( 'label' => 'Distinct cities', 'value' => (int) $totals->distinct_city, 'target' => '> 100', 'pass' => (int) $totals->distinct_city > 100 ),
+            'distinct_first'=> array( 'label' => 'Distinct given names', 'value' => (int) $totals->distinct_first, 'target' => '-', 'pass' => null ),
+            'distinct_email'=> array( 'label' => 'Distinct emails', 'value' => (int) $totals->distinct_email, 'target' => '-', 'pass' => null ),
+        );
+    }
+
+}
+
+/**
+ * WP-CLI front end.
+ *
+ * The defect report states its acceptance criteria as numbers so the fix can be
+ * verified rather than declared. `wp wcos verify` is that check.
+ */
+if ( defined( 'WP_CLI' ) && WP_CLI ) {
+
+    class WCOS_CLI_Command {
+
+        private function simulator() {
+            return $GLOBALS['wc_order_simulator'];
+        }
+
+        /**
+         * Measure order address data against the realism acceptance criteria.
+         *
+         * ## EXAMPLES
+         *
+         *     wp wcos verify
+         */
+        public function verify( $args, $assoc_args ) {
+            $results = $this->simulator()->measure_realism();
+
+            if ( is_wp_error( $results ) ) {
+                WP_CLI::error( $results->get_error_message() );
+            }
+
+            $rows   = array();
+            $failed = 0;
+
+            foreach ( $results as $result ) {
+                if ( false === $result['pass'] ) {
+                    $failed++;
+                }
+
+                $rows[] = array(
+                    'measure' => $result['label'],
+                    'value'   => (string) $result['value'],
+                    'target'  => $result['target'],
+                    'result'  => null === $result['pass'] ? '-' : ( $result['pass'] ? 'PASS' : 'FAIL' ),
+                );
+            }
+
+            WP_CLI\Utils\format_items( 'table', $rows, array( 'measure', 'value', 'target', 'result' ) );
+
+            if ( $failed ) {
+                WP_CLI::warning( sprintf( '%d criteria failed.', $failed ) );
+            } else {
+                WP_CLI::success( 'All criteria met.' );
+            }
+        }
+
+        /**
+         * Load fakenames.sql into the fixture table.
+         *
+         * ## OPTIONS
+         *
+         * [--force]
+         * : Truncate and reload even when the table already has rows.
+         *
+         * ## EXAMPLES
+         *
+         *     wp wcos seed --force
+         */
+        public function seed( $args, $assoc_args ) {
+            $force  = isset( $assoc_args['force'] );
+            $loaded = $this->simulator()->seed_fakenames( $force );
+
+            if ( is_wp_error( $loaded ) ) {
+                WP_CLI::error( $loaded->get_error_message() );
+            }
+
+            WP_CLI::success( sprintf( '%d fixture rows in place.', $loaded ) );
+        }
+
+        /**
+         * Give existing customers fresh synthetic names.
+         *
+         * Orders already written are not rewritten - this only changes what future
+         * orders inherit, and what the customer record itself says.
+         *
+         * ## OPTIONS
+         *
+         * [--last-name=<name>]
+         * : Only touch customers with this billing surname. Use this to clean up
+         *   the customers left behind by the "Example" fixture.
+         *
+         * [--limit=<n>]
+         * : Maximum customers to touch.
+         *
+         * ## EXAMPLES
+         *
+         *     wp wcos refresh-customers --last-name=Example
+         */
+        public function refresh_customers( $args, $assoc_args ) {
+            $last_name = isset( $assoc_args['last-name'] ) ? $assoc_args['last-name'] : '';
+            $limit     = isset( $assoc_args['limit'] ) ? absint( $assoc_args['limit'] ) : 0;
+
+            $result = $this->simulator()->refresh_customer_identities( $last_name, $limit );
+
+            WP_CLI::success( sprintf(
+                '%d customers re-identified, %d skipped.',
+                $result['updated'],
+                $result['skipped']
+            ) );
+        }
+    }
 }
 
 $GLOBALS['wc_order_simulator'] = new WC_Order_Simulator();

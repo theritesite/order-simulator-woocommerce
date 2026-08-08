@@ -26,3 +26,59 @@ Please note that we will provide support as necessary for this plugin, but we ca
   * If you have `Create User Accounts` to `No` then the orders will be assigned to existing users
   * If you have `Create User Accounts` to `Yes` then the orders will be assigned to new users created using the `fakenames.sql` data, and from existing users
 * Please make sure that you have `BACS` payments turned on
+
+## Data realism (1.2.0)
+
+Generated orders are meant to be searchable, not just numerous. 1.2.0 fixes two
+defects that made them the second thing but not the first.
+
+**Surnames had collapsed to one value.** A 2020 privacy sweep rewrote the fixture
+so nothing in it could be mistaken for reachable contact data - emails to
+`@example.com`, phone numbers to 555. The same sweep also overwrote the `surname`
+column with the literal string `Example`, taking 4,308 distinct surnames down to
+1. The surname column is restored; the email and phone scrub stays, because that
+part was the point.
+
+Surnames are drawn with their fixture frequency raised to the power
+`SURNAME_FREQUENCY_EXPONENT` (1.5, filterable via
+`wcos_surname_frequency_exponent`). The fixture's own curve is nearly flat - the
+most common surname is 0.47% of rows - which makes every search term about as
+selective as every other one and never asks an index a hard question. At 1.5 the
+head lands near 1.1% with a long tail behind it.
+
+**A third of orders had no address at all.** `create_user()` never checked what
+`wp_insert_user()` returned. Once the 10,000-row fixture saturated, inserts started
+failing on duplicate email - the uniqueness pre-check only looked at `user_login` -
+and the resulting `WP_Error` flowed into `get_user_meta()`, which answers `''` for
+every key. The order was written with every address field blank. The return is now
+checked, and an order is skipped rather than written without an address it can be
+found by. Given names and surnames are also drawn independently instead of read off
+a single fixture row, so the identity space is 1,340 x 4,308 rather than 10,000 and
+cannot run dry.
+
+Order fields are written through the WooCommerce CRUD layer rather than
+`update_post_meta()`, which under HPOS addresses the legacy post rather than the
+orders table.
+
+### Verifying
+
+    wp wcos verify
+
+Measures the live order address data against each criterion and prints PASS/FAIL.
+Replayed over 50,000 orders against the shipped fixture:
+
+| Criterion | Target | Measured |
+| --- | --- | --- |
+| Distinct surnames | >= 2000 | 2,991 |
+| Rows with an empty given or family name | < 1% | 0.000% |
+| Most common surname | 1-2% | 1.14% (`Williams`) |
+| Name/email pairs that disagree | 0 | 0 |
+
+### Other commands
+
+    wp wcos seed --force                        # reload the fixture table
+    wp wcos refresh-customers --last-name=Example  # re-identify stale customers
+
+`refresh-customers` is opt-in on purpose - it rewrites names on existing customer
+records. It does not rewrite orders that were already generated; a store whose
+history predates 1.2.0 needs regenerating to measure clean.
