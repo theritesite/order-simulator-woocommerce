@@ -3,7 +3,7 @@
   * Plugin Name: Order Simulator for WooCommerce
   * Plugin URI: http://www.75nineteen.com
   * Description: Automate orders to generate WooCommerce storefronts at scale for testing purposes.
-  * Version: 1.2.3
+  * Version: 1.2.4
   * Author: 75nineteen Media LLC
   * Author URI: http://www.75nineteen.com
 
@@ -1762,6 +1762,36 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
         }
 
         /**
+         * Drop the caches a long CLI loop accumulates.
+         *
+         * Guarded rather than called directly because wp_clear_object_cache() is a
+         * WP-CLI internal, and a plugin that fatals when it moves is worse than
+         * one that quietly falls back to wp_cache_flush().
+         */
+        private function free_memory() {
+            if ( function_exists( '\WP_CLI\Utils\wp_clear_object_cache' ) ) {
+                \WP_CLI\Utils\wp_clear_object_cache();
+                return;
+            }
+
+            global $wpdb, $wp_object_cache;
+
+            $wpdb->queries = array();
+
+            if ( is_object( $wp_object_cache ) ) {
+                foreach ( array( 'group_ops', 'stats', 'memcache_debug', 'cache' ) as $prop ) {
+                    if ( property_exists( $wp_object_cache, $prop ) ) {
+                        $wp_object_cache->$prop = array();
+                    }
+                }
+
+                if ( method_exists( $wp_object_cache, '__remoteset' ) ) {
+                    $wp_object_cache->__remoteset();
+                }
+            }
+        }
+
+        /**
          * Measure order address data against the realism acceptance criteria.
          *
          * ## EXAMPLES
@@ -2018,11 +2048,31 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
                 }
 
                 WP_CLI::log( sprintf(
-                    '  ... %d examined, %d updated, through order #%d',
+                    '  ... %d examined, %d updated, through order #%d, %dMB',
                     $totals['examined'],
                     $totals['updated'],
-                    $after_id
+                    $after_id,
+                    round( memory_get_usage( true ) / 1048576 )
                 ) );
+
+                // WITHOUT THIS, --all DIES.
+                //
+                // Every wc_get_order() populates the WordPress object cache and
+                // WooCommerce's own order cache, and nothing evicts them inside a
+                // single CLI process. On the sandbox that reached PHP's 512MB
+                // ceiling after 6,000 orders and took the run down with a fatal:
+                // "Allowed memory size of 536870912 bytes exhausted".
+                //
+                // The resume point had already been committed, so nothing was
+                // lost - but the command could only ever do 6,000 orders per
+                // invocation, which is not what --all promises.
+                //
+                // wp_clear_object_cache() is WP-CLI's own remedy: it flushes the
+                // object cache and drops $wpdb->queries. Both matter; the query
+                // log alone grows without bound when SAVEQUERIES is on.
+                if ( ! $dry_run ) {
+                    $this->free_memory();
+                }
             } while ( $all );
 
             if ( $samples ) {
