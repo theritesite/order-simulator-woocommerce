@@ -33,6 +33,31 @@ if ( ! class_exists( 'WC_Settings_Order_Simulator' ) ) :
         /**
          * Get settings array
          *
+         * IMPORTANT - why every field below carries an explicit `value`.
+         *
+         * This page keeps all of its settings inside ONE option,
+         * `wc_order_simulator_settings`, and each field's `id` is only a form field
+         * name. WooCommerce does not know that. `WC_Admin_Settings::output_fields()`
+         * renders each field from `get_option( $field['id'], $field['default'] )`,
+         * treating the id as a standalone option name - and
+         * `WC_Admin_Settings::save_fields()`, which runs on the global
+         * `woocommerce_update_options` action fired by every settings save on any
+         * tab, writes those standalone options back.
+         *
+         * So `wcos_orders_per_hour` and friends exist as real options, and they win
+         * the render. The field then shows the standalone option's value rather than
+         * the value actually stored in `wc_order_simulator_settings`, and because
+         * save() reads the POSTed (displayed) value, hitting Save writes that stale
+         * number over the real setting. From the outside it looks like the field
+         * refuses to change - which is exactly what it was doing.
+         *
+         * Passing `value` explicitly short-circuits it: output_fields() uses
+         * `$field['value']` when present and never calls get_option() at all. That
+         * is the whole fix, and it holds no matter what stray options exist.
+         *
+         * `default` is left in place because WooCommerce still reads it in a couple
+         * of paths, but it is no longer what drives the render.
+         *
          * @return array
          */
         public function get_settings() {
@@ -76,6 +101,7 @@ if ( ! class_exists( 'WC_Settings_Order_Simulator' ) ) :
                     'id'       => 'wcos_orders_per_hour',
                     'css'      => 'width:100px;',
                     'default'  => $values['orders_per_hour'],
+                    'value'    => $values['orders_per_hour'],
                     'type'     => 'number',
                     'desc_tip' =>  true,
                 ),
@@ -85,6 +111,7 @@ if ( ! class_exists( 'WC_Settings_Order_Simulator' ) ) :
                     'desc'     => __( 'The products that will be added to the generated orders. Leave empty to randomly select from all products.', 'woocommerce' ),
                     'id'       => 'wcos_products',
                     'default'  => $data_value,
+                    'value'    => $data_value,
                     'type'     => 'text',
                     'class'    => 'wc-product-search',
                     'css'      => 'min-width: 350px;',
@@ -104,6 +131,7 @@ if ( ! class_exists( 'WC_Settings_Order_Simulator' ) ) :
                         'min'   => 1
                     ),
                     'default'   => $values['min_order_products'],
+                    'value'     => $values['min_order_products'],
                     'css'       => 'width:50px;',
                     'autoload'  => false
                 ),
@@ -118,6 +146,7 @@ if ( ! class_exists( 'WC_Settings_Order_Simulator' ) ) :
                         'min'   => 1
                     ),
                     'default'   => $values['max_order_products'],
+                    'value'     => $values['max_order_products'],
                     'css'       => 'width:50px;',
                     'autoload'  => false
                 ),
@@ -133,6 +162,7 @@ if ( ! class_exists( 'WC_Settings_Order_Simulator' ) ) :
                         1   => __('Yes - create a new account or randomly select an existing account to assign to new orders', 'woocommerce')
                     ),
                     'default'   => $values['create_users'],
+                    'value'     => $values['create_users'],
                     'autoload'  => false,
                     'class'     => 'wc-enhanced-select'
                 ),
@@ -144,6 +174,7 @@ if ( ! class_exists( 'WC_Settings_Order_Simulator' ) ) :
                     'desc'      => __( '%', 'woocommerce' ),
                     'type'      => 'number',
                     'default'   => $values['order_completed_pct'],
+                    'value'     => $values['order_completed_pct'],
                     'autoload'  => false,
                     'css'       => 'width:50px;',
                     'custom_attributes' => array(
@@ -159,6 +190,7 @@ if ( ! class_exists( 'WC_Settings_Order_Simulator' ) ) :
                     'desc'      => __( '%', 'woocommerce' ),
                     'type'      => 'number',
                     'default'   => $values['order_processing_pct'],
+                    'value'     => $values['order_processing_pct'],
                     'autoload'  => false,
                     'css'       => 'width:50px;',
                     'custom_attributes' => array(
@@ -174,6 +206,7 @@ if ( ! class_exists( 'WC_Settings_Order_Simulator' ) ) :
                     'desc'      => __( '%', 'woocommerce' ),
                     'type'      => 'number',
                     'default'   => $values['order_failed_pct'],
+                    'value'     => $values['order_failed_pct'],
                     'autoload'  => false,
                     'css'       => 'width:50px;',
                     'custom_attributes' => array(

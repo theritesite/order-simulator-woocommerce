@@ -137,10 +137,36 @@ maiden names, 10,000 emails, 9,200 phone numbers and 5,840 cities.
 
 ### Other commands
 
-    wp wcos seed --force                           # reload the fixture table
+    wp wcos generation 0 --unschedule               # stop generating orders
+    wp wcos clean-options                           # remove the stray per-field options
+    wp wcos seed --force                            # reload the fixture table
     wp wcos refresh-customers --last-name=Example   # re-identify stale customers
     wp wcos reidentify-orders --dry-run             # see what would change on orders
     wp wcos reidentify-orders --batch=2000 --yes    # repair a batch of orders
+
+## The settings screen used to ignore edits
+
+Fixed in 1.2.1. Change "Orders per Hour", hit Save, and the old number came back.
+
+Every field on this page keeps its value inside one option,
+`wc_order_simulator_settings`, and each field's `id` is only a form field name.
+WooCommerce does not know that: `WC_Admin_Settings::output_fields()` renders a
+field from `get_option( $field['id'], $field['default'] )`, treating the id as an
+option name of its own. Those options exist - all eight of them were sitting in
+the sandbox's options table - so the form showed the stray option's value rather
+than the stored setting. `save()` then read the POSTed (displayed) number and
+wrote it into the real settings, so hitting Save actively reinstated the stale
+value.
+
+Each field now passes an explicit `value`, which `output_fields()` uses in
+preference and which stops it consulting `get_option()` at all. That holds
+whatever stray options exist. `wp wcos clean-options` removes them anyway;
+it names the eight explicitly rather than matching `wcos_*`, because the plugin's
+own bookkeeping shares that prefix and a wildcard delete would take
+`wcos_fakenames_version` with it and silently trigger a reseed.
+
+What originally created those options is not established. Nothing in the plugin
+writes them today.
 
 ## Repairing a store that predates 1.2.0
 
@@ -155,10 +181,17 @@ WooCommerce CRUD layer so the orders table, the synced post meta and the lookup
 tables stay in agreement. Direct SQL would be perhaps a hundred times faster, but
 hand-maintaining that fan-out is exactly the class of mistake being repaired here.
 
-    wp option update wc_order_simulator_settings --format=json '{"orders_per_hour":0}'
+    wp wcos generation 0 --unschedule
     wp wcos refresh-customers --last-name=Example
     wp wcos reidentify-orders --dry-run
     wp wcos reidentify-orders --batch=2000 --yes     # repeat until it reports 0
+
+Do not stop the generator with `wp option update wc_order_simulator_settings
+--format=json '{"orders_per_hour":0}'`. That replaces the whole option, so the
+product selection and the status split silently fall back to defaults - a store
+set to 100% completed quietly becomes 90/5/5. Use `wp wcos generation`, or
+`wp option patch update wc_order_simulator_settings orders_per_hour 0`, both of
+which change one key and leave the rest alone.
 
 Order matters. `reidentify-orders` copies what the customer record currently
 says, so refreshing customers has to come first - otherwise it faithfully copies

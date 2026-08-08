@@ -3,7 +3,7 @@
   * Plugin Name: Order Simulator for WooCommerce
   * Plugin URI: http://www.75nineteen.com
   * Description: Automate orders to generate WooCommerce storefronts at scale for testing purposes.
-  * Version: 1.2.0
+  * Version: 1.2.1
   * Author: 75nineteen Media LLC
   * Author URI: http://www.75nineteen.com
 
@@ -1449,6 +1449,84 @@ PRIMARY KEY  (number)
     }
 
     /**
+     * The settings-page field IDs that WooCommerce has been writing as options.
+     *
+     * These are form field names, not settings. Everything this plugin actually
+     * reads lives in `wc_order_simulator_settings`. WooCommerce writes them anyway
+     * because it treats a field `id` as an option name, and then renders the field
+     * from the option rather than from the real setting - which is what made the
+     * settings page appear to ignore edits.
+     *
+     * Listed explicitly rather than matched on the `wcos_` prefix, because the
+     * plugin's own bookkeeping options share that prefix and a wildcard delete
+     * would take `wcos_fakenames_version` with it and silently trigger a reseed.
+     */
+    private static function stray_field_options() {
+        return array(
+            'wcos_orders_per_hour',
+            'wcos_products',
+            'wcos_min_order_products',
+            'wcos_max_order_products',
+            'wcos_create_users',
+            'wcos_order_completed_pct',
+            'wcos_order_processing_pct',
+            'wcos_order_failed_pct',
+        );
+    }
+
+    /**
+     * Delete the stray per-field options.
+     *
+     * @param bool $dry_run Report without deleting.
+     *
+     * @return array option name => current value, for those that exist.
+     */
+    public function clean_stray_options( $dry_run = false ) {
+        $found = array();
+
+        foreach ( self::stray_field_options() as $name ) {
+            $value = get_option( $name, null );
+
+            if ( null === $value ) {
+                continue;
+            }
+
+            $found[ $name ] = $value;
+
+            if ( ! $dry_run ) {
+                delete_option( $name );
+            }
+        }
+
+        return $found;
+    }
+
+    /**
+     * Turn order generation off, or back on.
+     *
+     * Exists because the settings screen could not be trusted to do it: the field
+     * rendered from a stray option rather than from the stored setting, so saving
+     * wrote the stale number straight back.
+     *
+     * @param int $per_hour Orders per hour. 0 stops generation.
+     *
+     * @return int The value now stored.
+     */
+    public function set_orders_per_hour( $per_hour ) {
+        $settings = self::get_settings();
+
+        // Read-modify-write the whole array. Replacing the option outright would
+        // drop the product selection and the status split back to defaults.
+        $settings['orders_per_hour'] = max( 0, (int) $per_hour );
+
+        update_option( 'wc_order_simulator_settings', $settings );
+
+        $this->settings = $settings;
+
+        return $settings['orders_per_hour'];
+    }
+
+    /**
      * How many customers still carry a given billing surname.
      *
      * Used to warn when reidentify-orders is about to faithfully copy the very
@@ -1664,6 +1742,97 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
             }
 
             WP_CLI::success( sprintf( '%d fixture rows in place.', $loaded ) );
+        }
+
+        /**
+         * Stop or start order generation.
+         *
+         * Use this rather than the settings screen on any install that has not yet
+         * had the stray per-field options cleaned up, because there the field
+         * rendered from the stray option and saving wrote the stale value back.
+         *
+         * ## OPTIONS
+         *
+         * [<per-hour>]
+         * : Orders per hour. 0 stops generation. Omit to just report the setting.
+         *
+         * [--unschedule]
+         * : Also clear the wcos_create_orders cron event. Note that reactivating
+         *   the plugin re-adds it, whereas orders_per_hour = 0 survives.
+         *
+         * ## EXAMPLES
+         *
+         *     wp wcos generation            # report
+         *     wp wcos generation 0          # stop
+         *     wp wcos generation 0 --unschedule
+         *     wp wcos generation 200        # resume
+         */
+        public function generation( $args, $assoc_args ) {
+            if ( isset( $args[0] ) && '' !== $args[0] ) {
+                $now = $this->simulator()->set_orders_per_hour( $args[0] );
+                WP_CLI::success( sprintf( 'orders_per_hour is now %d.', $now ) );
+            } else {
+                $settings = WC_Order_Simulator::get_settings();
+                WP_CLI::log( sprintf( 'orders_per_hour = %d', $settings['orders_per_hour'] ) );
+            }
+
+            if ( isset( $assoc_args['unschedule'] ) ) {
+                $cleared = 0;
+                while ( $next = wp_next_scheduled( 'wcos_create_orders' ) ) {
+                    wp_unschedule_event( $next, 'wcos_create_orders' );
+                    $cleared++;
+                    if ( $cleared > 50 ) {
+                        break;
+                    }
+                }
+                WP_CLI::success( sprintf( 'Cleared %d scheduled wcos_create_orders event(s).', $cleared ) );
+            }
+
+            $next = wp_next_scheduled( 'wcos_create_orders' );
+
+            WP_CLI::log( $next
+                ? sprintf( 'Next scheduled run: %s GMT', gmdate( 'Y-m-d H:i:s', $next ) )
+                : 'No run scheduled.'
+            );
+        }
+
+        /**
+         * Delete the stray per-field options that break the settings screen.
+         *
+         * WooCommerce treats a settings field `id` as an option name, writes those
+         * options, and then renders the field from them instead of from the real
+         * stored setting. That is why edits appeared to revert. 1.2.1 pins each
+         * field to its stored value so the render is correct regardless, but the
+         * stray options are still litter worth removing.
+         *
+         * ## OPTIONS
+         *
+         * [--dry-run]
+         * : Report what exists without deleting.
+         *
+         * ## EXAMPLES
+         *
+         *     wp wcos clean-options --dry-run
+         *     wp wcos clean-options
+         */
+        public function clean_options( $args, $assoc_args ) {
+            $dry_run = isset( $assoc_args['dry-run'] );
+            $found   = $this->simulator()->clean_stray_options( $dry_run );
+
+            if ( ! $found ) {
+                WP_CLI::success( 'No stray per-field options present.' );
+                return;
+            }
+
+            foreach ( $found as $name => $value ) {
+                WP_CLI::log( sprintf( '  %s = %s', $name, is_scalar( $value ) ? $value : wp_json_encode( $value ) ) );
+            }
+
+            WP_CLI::success( sprintf(
+                '%d stray option(s) %s. The plugin reads none of them; wc_order_simulator_settings is the real store.',
+                count( $found ),
+                $dry_run ? 'found (dry run)' : 'deleted'
+            ) );
         }
 
         /**
