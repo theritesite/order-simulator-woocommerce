@@ -93,19 +93,55 @@ class WC_Order_Simulator {
      * other one and an index is never asked a hard question. Raising the counts to
      * this power sharpens the curve toward the long tail real surname data has.
      *
-     * At 1.5 the most common surname lands at 1.11% - inside the 1-2% the defect
-     * report asks for - while a 50,000-order run still expects ~3,777 distinct
-     * surnames against a floor of 2,000, and 2,924 surnames stay rare enough to
-     * appear fewer than three times. Higher exponents buy a steeper head at the
-     * cost of the tail: 2.2 reaches 2.00% but drops expected distinct surnames to
-     * 1,594, which fails the floor. Filterable via wcos_surname_frequency_exponent.
+     * The exponent trades the head against the tail, and both are acceptance
+     * criteria, so it was swept rather than guessed. Measured over a 50,000-order
+     * replay of this generator:
+     *
+     *   1.5   3,123 distinct surnames   top 0.97%   head too flat
+     *   1.7   2,488 distinct surnames   top 1.31%   <- both criteria, with margin
+     *   1.8   2,197 distinct surnames   top 1.39%   thinner margin on distinct
+     *   1.9   1,900 distinct surnames   top 1.50%   fails the 2,000 floor
+     *
+     * 1.5 looks fine on paper - the theoretical head is 1.11% - but customer reuse
+     * flattens the realised distribution, and it lands just under the 1% floor. The
+     * lesson is that this constant has to be measured against a replay, not
+     * computed off the corpus. Filterable via wcos_surname_frequency_exponent.
      */
-    const SURNAME_FREQUENCY_EXPONENT = 1.5;
+    const SURNAME_FREQUENCY_EXPONENT = 1.7;
 
     /**
-     * Domain for generated addresses. Reserved by RFC 2606 - never deliverable.
+     * Email domains, with the weight each carries out of 100.
+     *
+     * Every one is unregistrable: RFC 2606 reserves example.com/.net/.org and the
+     * .example, .test and .invalid TLDs, and RFC 6761 reiterates .test and
+     * .invalid. Mail addressed here cannot leave the building no matter what the
+     * store's mail settings say.
+     *
+     * Weighted rather than uniform because real stores cluster hard on a handful
+     * of providers. A flat spread across twelve domains would make every domain
+     * equally selective, which is the same mistake the flat surname distribution
+     * made - it just moves it to a different column.
+     *
+     * Deliberately NOT etest.com or sample.com: both are ordinary registrable .com
+     * names owned by someone who is not us, so a store with mail enabled would aim
+     * real messages at a real domain.
      */
-    const EMAIL_DOMAIN = 'example.com';
+    private static function email_domains() {
+        return array(
+            'example.com'     => 35,
+            'example.net'     => 14,
+            'example.org'     => 11,
+            'mail.example'    => 8,
+            'inbox.test'      => 7,
+            'webmail.example' => 6,
+            'mailbox.test'    => 5,
+            'post.example'    => 4,
+            'mail.invalid'    => 4,
+            'users.invalid'   => 3,
+            'relay.test'      => 2,
+            'host.example'    => 1,
+        );
+    }
 
     private $users        = array();
     private $users_loaded = false;
@@ -433,6 +469,163 @@ PRIMARY KEY  (number)
     }
 
     /**
+     * Draw an email domain against its weight.
+     */
+    private function pick_email_domain() {
+        $domains = self::email_domains();
+        $roll    = mt_rand( 1, array_sum( $domains ) );
+        $acc     = 0;
+
+        foreach ( $domains as $domain => $weight ) {
+            $acc += $weight;
+            if ( $roll <= $acc ) {
+                return $domain;
+            }
+        }
+
+        return 'example.com';
+    }
+
+    /**
+     * Compose an email local part from a name.
+     *
+     * Every pattern keeps the surname whole, which is what lets a search by name
+     * and a search by email agree. Patterns vary because a store where every
+     * address is first.last is a store where one substring rule matches
+     * everything - a lookup feature can get its parsing wrong and still look
+     * right.
+     *
+     * @param bool $numbered Append digits. Reserved for retries, so that early
+     *                       customers get the clean address and later ones get the
+     *                       numbered variant, the way real mailboxes fill up.
+     */
+    private function email_local_part( $given, $surname, $numbered = false ) {
+        $initial = substr( $given, 0, 1 );
+
+        $patterns = array(
+            $given . '.' . $surname,
+            $given . $surname,
+            $initial . $surname,
+            $given . '_' . $surname,
+            $surname . '.' . $given,
+            $given . '-' . $surname,
+            $initial . '.' . $surname,
+        );
+
+        $base = $patterns[ mt_rand( 0, count( $patterns ) - 1 ) ];
+
+        if ( ! $numbered ) {
+            return $base;
+        }
+
+        return mt_rand( 1, 100 ) <= 40
+            ? $base . mt_rand( 1940, 2009 )   // reads as a birth year
+            : $base . mt_rand( 2, 9999 );
+    }
+
+    /**
+     * Generate a telephone number for a country, in that country's own format.
+     *
+     * OFFICIALLY RESERVED. These ranges are set aside by the national numbering
+     * authority for fiction and can never be allocated to a subscriber:
+     *
+     *   US, CA  NANP 555-0100..555-0199
+     *   GB      Ofcom drama ranges (01632 960xxx, 020 7946 0xxx, 07700 900xxx)
+     *   AU      ACMA drama ranges ((0x) 5550 1xxx, 0491 570 xxx)
+     *   FR      ARCEP fiction ranges (01 99 00 xx xx and the per-zone equivalents)
+     *
+     * CONVENTION ONLY. NZ, BE and BR publish no fictional range this plugin can
+     * cite. Those follow the national format with a 555/5550 subscriber block,
+     * which is the usual fake-number convention but is not a guarantee the number
+     * is unallocated. Nothing here dials anything, so the exposure is a human
+     * copying a number out of test data - small, but real, and better written down
+     * than discovered.
+     *
+     * Generated per order rather than read off the fixture row, so phone variety
+     * is not capped at the fixture's 10,000 values.
+     */
+    private function random_phone( $country ) {
+        $pick = function ( array $set ) {
+            return $set[ mt_rand( 0, count( $set ) - 1 ) ];
+        };
+
+        $digits = function ( $n ) {
+            return str_pad( (string) mt_rand( 0, pow( 10, $n ) - 1 ), $n, '0', STR_PAD_LEFT );
+        };
+
+        switch ( strtoupper( (string) $country ) ) {
+            case 'US':
+                return sprintf( '(%d) 555-01%s', $pick( self::us_area_codes() ), $digits( 2 ) );
+
+            case 'CA':
+                return sprintf( '(%d) 555-01%s', $pick( self::ca_area_codes() ), $digits( 2 ) );
+
+            case 'GB':
+                return mt_rand( 1, 100 ) <= 30
+                    ? sprintf( '07700 900%s', $digits( 3 ) )
+                    : sprintf( '%s%s', $pick( self::gb_drama_prefixes() ), $digits( 3 ) );
+
+            case 'AU':
+                return mt_rand( 1, 100 ) <= 30
+                    ? sprintf( '0491 570 %s', $digits( 3 ) )
+                    : sprintf( '(0%d) 5550 1%s', $pick( array( 2, 3, 7, 8 ) ), $digits( 3 ) );
+
+            case 'FR':
+                return sprintf(
+                    '%s %s %s',
+                    $pick( array( '01 99 00', '02 61 91', '03 53 01', '04 65 71', '05 36 49', '06 39 98' ) ),
+                    $digits( 2 ),
+                    $digits( 2 )
+                );
+
+            case 'NZ':   // convention
+                return mt_rand( 1, 100 ) <= 30
+                    ? sprintf( '021 555 0%s', $digits( 3 ) )
+                    : sprintf( '(0%d) 555 0%s', $pick( array( 3, 4, 6, 7, 9 ) ), $digits( 3 ) );
+
+            case 'BE':   // convention
+                $roll = mt_rand( 1, 100 );
+                if ( $roll <= 30 ) {
+                    return sprintf( '04%d 55 01 %s', $pick( array( 70,71,72,73,74,75,76,77,78,79,83,84,85,86,87,88,89 ) ), $digits( 2 ) );
+                }
+                if ( $roll <= 55 ) {
+                    return sprintf( '0%d 555 01 %s', $pick( array( 2, 3, 4, 9 ) ), $digits( 2 ) );
+                }
+                // Belgium mixes two- and three-digit area codes. Both are used
+                // because the four two-digit codes alone only span 400 numbers.
+                return sprintf( '0%d 55 01 %s', $pick( array( 10,11,12,13,14,15,16,19,50,51,52,53,54,55,56,57,58,59,60,61,63,64,65,67,68,69,71,80,81,82,83,84,85,86,87,89 ) ), $digits( 2 ) );
+
+            case 'BR':   // convention
+                return mt_rand( 1, 100 ) <= 30
+                    ? sprintf( '(%d) 95550-1%s', $pick( self::br_area_codes() ), $digits( 3 ) )
+                    : sprintf( '(%d) 5550-1%s', $pick( self::br_area_codes() ), $digits( 3 ) );
+        }
+
+        return sprintf( '(%d) 555-01%s', $pick( self::us_area_codes() ), $digits( 2 ) );
+    }
+
+    private static function us_area_codes() {
+        return array(201,202,203,205,206,207,208,209,210,212,213,214,215,216,217,218,219,224,225,228,229,231,234,239,240,248,251,252,253,254,256,260,262,267,269,270,276,281,301,302,303,304,305,307,308,309,310,312,313,314,315,316,317,318,319,320,321,323,325,330,331,334,336,337,339,346,347,351,352,360,361,364,380,385,386,401,402,404,405,406,407,408,409,410,412,413,414,415,417,419,423,424,425,430,432,434,435,440,442,443,458,463,469,470,475,478,479,480,484,501,502,503,504,505,507,508,509,510,512,513,515,516,517,518,520,530,531,534,539,540,541,551,559,561,562,563,564,567,570,571,573,574,575,580,585,586,601,602,603,605,606,607,608,609,610,612,614,615,616,617,618,619,620,623,626,628,629,630,631,636,641,646,650,651,657,660,661,662,667,669,678,681,682,701,702,703,704,706,707,708,712,713,714,715,716,717,718,719,720,724,725,727,731,732,734,737,740,743,747,754,757,760,762,763,765,769,770,772,773,774,775,779,781,785,786,801,802,803,804,805,806,808,810,812,813,814,815,816,817,818,828,830,831,832,843,845,847,848,850,854,856,857,858,859,860,862,863,864,865,870,872,878,901,903,904,906,907,908,909,910,912,913,914,915,916,917,918,919,920,925,928,929,930,931,934,936,937,938,940,941,947,949,951,952,954,956,959,970,971,972,973,978,979,980,984,985,989);
+    }
+
+    private static function ca_area_codes() {
+        return array(204,226,236,249,250,289,306,343,365,387,403,416,418,431,437,438,450,506,514,519,548,579,581,587,604,613,639,647,672,705,709,742,778,780,782,807,819,825,867,873,902,905);
+    }
+
+    private static function br_area_codes() {
+        return array(11,12,13,14,15,16,17,18,19,21,22,24,27,28,31,32,33,34,35,37,38,41,42,43,44,45,46,47,48,49,51,53,54,55,61,62,63,64,65,66,67,68,69,71,73,74,75,77,79,81,82,83,84,85,86,87,88,89,91,92,93,94,95,96,97,98,99);
+    }
+
+    private static function gb_drama_prefixes() {
+        return array(
+            '01632 960', '020 7946 0', '0113 496 0', '0114 496 0', '0115 496 0',
+            '0116 496 0', '0117 496 0', '0118 496 0', '0121 496 0', '0131 496 0',
+            '0141 496 0', '0151 496 0', '0161 496 0', '0191 498 0', '028 9018 0',
+            '029 2018 0',
+        );
+    }
+
+    /**
      * Compose an unused synthetic identity.
      *
      * The email is derived from the name rather than drawn separately, so that
@@ -465,8 +658,13 @@ PRIMARY KEY  (number)
                 continue;
             }
 
-            $login = $slug_given . '.' . $slug_surname . mt_rand( 100, 99999 );
-            $email = $login . '@' . self::EMAIL_DOMAIN;
+            // First couple of attempts go for a clean address; only once those
+            // collide does the number appear. Early customers end up with
+            // j.moreno@ and later ones with j.moreno4471@, which is how real
+            // mailboxes fill up.
+            $local = $this->email_local_part( $slug_given, $slug_surname, $attempt >= 2 );
+            $login = $local;
+            $email = $local . '@' . $this->pick_email_domain();
 
             // Both checks, not just the login one. Checking only user_login is the
             // bug that made wp_insert_user() fail on duplicate email once the
@@ -521,7 +719,9 @@ PRIMARY KEY  (number)
             'postcode'   => $address->zipcode,
             'country'    => $address->country,
             'email'      => $identity['email'],
-            'phone'      => $address->telephonenumber,
+            // Generated from the country rather than copied off the fixture row,
+            // so phone variety is not capped at the fixture's 10,000 values.
+            'phone'      => $this->random_phone( $address->country ),
         );
 
         foreach ( array( 'billing', 'shipping' ) as $type ) {
@@ -1128,6 +1328,44 @@ PRIMARY KEY  (number)
 
         $empty_name_pct = 100 * max( (int) $totals->empty_last, (int) $totals->empty_first ) / $rows;
 
+        $phones = $wpdb->get_row(
+            "SELECT COUNT(DISTINCT phone) AS distinct_phone, SUM(phone = '') AS empty_phone
+             FROM   {$addresses}"
+        );
+
+        $top_phone = $wpdb->get_row(
+            "SELECT phone, COUNT(*) AS c
+             FROM   {$addresses}
+             WHERE  phone <> ''
+             GROUP  BY phone
+             ORDER  BY c DESC
+             LIMIT  1"
+        );
+
+        $top_phone_share = $top_phone ? ( 100 * (int) $top_phone->c / $rows ) : 0.0;
+
+        // Domain spread. A store where one domain holds everything is a store
+        // where searching by domain is not a test of anything.
+        $domain_rows = $wpdb->get_results(
+            "SELECT SUBSTRING_INDEX(email, '@', -1) AS domain, COUNT(*) AS c
+             FROM   {$addresses}
+             WHERE  email <> ''
+             GROUP  BY domain
+             ORDER  BY c DESC"
+        );
+
+        $top_domain_share = $domain_rows ? ( 100 * (int) $domain_rows[0]->c / $rows ) : 0.0;
+
+        // Anything outside the reserved set could carry mail off the box.
+        $reserved   = self::email_domains();
+        $escapable  = 0;
+
+        foreach ( (array) $domain_rows as $domain_row ) {
+            if ( ! isset( $reserved[ strtolower( $domain_row->domain ) ] ) ) {
+                $escapable += (int) $domain_row->c;
+            }
+        }
+
         return array(
             'rows'          => array( 'label' => 'Address rows measured', 'value' => (int) $totals->rows_total, 'target' => '-', 'pass' => null ),
             'distinct_last' => array( 'label' => 'Distinct surnames', 'value' => (int) $totals->distinct_last, 'target' => '>= 2000', 'pass' => (int) $totals->distinct_last >= 2000 ),
@@ -1136,6 +1374,12 @@ PRIMARY KEY  (number)
             'email_match'   => array( 'label' => 'Distinct name/email pairs where the email omits the surname', 'value' => $uncorrelated, 'target' => '0', 'pass' => 0 === $uncorrelated ),
             'empty_address' => array( 'label' => 'Rows with an empty street address', 'value' => (int) $totals->empty_address, 'target' => '0', 'pass' => 0 === (int) $totals->empty_address ),
             'distinct_city' => array( 'label' => 'Distinct cities', 'value' => (int) $totals->distinct_city, 'target' => '> 100', 'pass' => (int) $totals->distinct_city > 100 ),
+            'distinct_phone'=> array( 'label' => 'Distinct phone numbers', 'value' => (int) $phones->distinct_phone, 'target' => '>= 2000', 'pass' => (int) $phones->distinct_phone >= 2000 ),
+            'top_phone'     => array( 'label' => 'Most common phone number', 'value' => sprintf( '%.2f%%', $top_phone_share ), 'target' => '< 1%', 'pass' => $top_phone_share < 1.0 ),
+            'empty_phone'   => array( 'label' => 'Rows with an empty phone number', 'value' => (int) $phones->empty_phone, 'target' => '0', 'pass' => 0 === (int) $phones->empty_phone ),
+            'domains'       => array( 'label' => 'Distinct email domains', 'value' => count( (array) $domain_rows ), 'target' => '> 1', 'pass' => count( (array) $domain_rows ) > 1 ),
+            'top_domain'    => array( 'label' => 'Most common email domain', 'value' => sprintf( '%.1f%%', $top_domain_share ), 'target' => '< 60%', 'pass' => $top_domain_share < 60.0 ),
+            'deliverable'   => array( 'label' => 'Rows on a domain that is not RFC-reserved', 'value' => $escapable, 'target' => '0', 'pass' => 0 === $escapable ),
             'distinct_first'=> array( 'label' => 'Distinct given names', 'value' => (int) $totals->distinct_first, 'target' => '-', 'pass' => null ),
             'distinct_email'=> array( 'label' => 'Distinct emails', 'value' => (int) $totals->distinct_email, 'target' => '-', 'pass' => null ),
         );
