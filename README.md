@@ -137,9 +137,66 @@ maiden names, 10,000 emails, 9,200 phone numbers and 5,840 cities.
 
 ### Other commands
 
-    wp wcos seed --force                        # reload the fixture table
-    wp wcos refresh-customers --last-name=Example  # re-identify stale customers
+    wp wcos seed --force                           # reload the fixture table
+    wp wcos refresh-customers --last-name=Example   # re-identify stale customers
+    wp wcos reidentify-orders --dry-run             # see what would change on orders
+    wp wcos reidentify-orders --batch=2000 --yes    # repair a batch of orders
 
-`refresh-customers` is opt-in on purpose - it rewrites names on existing customer
-records. It does not rewrite orders that were already generated; a store whose
-history predates 1.2.0 needs regenerating to measure clean.
+## Repairing a store that predates 1.2.0
+
+Orders written before 1.2.0 keep their bad identity data - the fix changes what
+gets generated, not what is already on disk. You do not have to delete them
+though. The orders are fine apart from four columns: dates, totals, line items
+and the status mix are all correct, and regenerating throws that away along with
+several hours.
+
+`reidentify-orders` rewrites only the identity columns, going through the
+WooCommerce CRUD layer so the orders table, the synced post meta and the lookup
+tables stay in agreement. Direct SQL would be perhaps a hundred times faster, but
+hand-maintaining that fan-out is exactly the class of mistake being repaired here.
+
+    wp option update wc_order_simulator_settings --format=json '{"orders_per_hour":0}'
+    wp wcos refresh-customers --last-name=Example
+    wp wcos reidentify-orders --dry-run
+    wp wcos reidentify-orders --batch=2000 --yes     # repeat until it reports 0
+
+Order matters. `reidentify-orders` copies what the customer record currently
+says, so refreshing customers has to come first - otherwise it faithfully copies
+the names you are trying to replace. It warns if you forget.
+
+Stopping the generator first matters too, or it keeps appending fresh orders to
+the end of the range while you are repairing the start of it.
+
+Batches are keyed on the order ID and the resume point is stored, so a process
+the host kills picks up where it stopped rather than starting over. `--all` runs
+to completion in one go where that is safe. `--dry-run` writes nothing and also
+reports which customer IDs sit behind the orders, which is the quickest way to
+see what the blank-address orders were attached to.
+
+Two things it does not do:
+
+- **The trigram index is not rebuilt.** `wp_fwol` is ~4.3M rows derived from
+  order data and goes stale. Deactivating Fast Woo Order Lookup drops the table,
+  reactivating rebuilds it. If the point of the exercise is measuring whether
+  that index helps, take the baseline with it off first.
+- **The analytics lookup tables are not regenerated.** `wp_wc_customer_lookup`
+  keeps its own copy of customer names. It is off the critical path for order
+  search - `wc_get_orders( 's' => ... )` reads the orders and addresses tables -
+  but it will disagree until regenerated from WooCommerce > Status > Tools.
+
+## Building and deploying
+
+    npm run package        # -> zip_files/order-simulator-woocommerce.zip
+
+Uses `../trs-package.js` and the declared `trsPackage.include` payload, per the
+suite's build contract. Not `wp-scripts plugin-zip`, which writes a flat archive
+with no `<slug>/` wrapper - and the folder inside the zip becomes the installed
+plugin directory, so a flat archive installs a second copy rather than updating
+in place.
+
+The payload is four files. There is no compile step; the `build/`, `index.js` and
+webpack config in this repo are left over from a build-process experiment and
+nothing enqueues them.
+
+On load, a version bump to the fixture reseeds the `fakenames` table
+automatically - no deactivate/reactivate needed.

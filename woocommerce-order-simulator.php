@@ -1260,6 +1260,209 @@ PRIMARY KEY  (number)
         return array( 'updated' => $updated, 'skipped' => $skipped );
     }
 
+    /* ---------------------------------------------------------------------
+     * Repairing orders that already exist
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Order IDs after a given ID, in ID order.
+     *
+     * Batching is keyed on the ID rather than an offset so that a run interrupted
+     * halfway resumes where it stopped instead of re-walking from the start - the
+     * sandbox has 54,484 orders and a hosting platform that will not let one
+     * process hold the CPU for as long as a single pass over them takes.
+     */
+    private function order_ids_after( $after_id, $limit ) {
+        global $wpdb;
+
+        $hpos = $wpdb->prefix . 'wc_orders';
+
+        if ( $wpdb->get_var( "SHOW TABLES LIKE '{$hpos}'" ) === $hpos ) {
+            return $wpdb->get_col( $wpdb->prepare(
+                "SELECT id FROM {$hpos} WHERE id > %d AND type = 'shop_order' ORDER BY id ASC LIMIT %d",
+                $after_id,
+                $limit
+            ) );
+        }
+
+        return $wpdb->get_col( $wpdb->prepare(
+            "SELECT ID FROM {$wpdb->posts} WHERE ID > %d AND post_type = 'shop_order' ORDER BY ID ASC LIMIT %d",
+            $after_id,
+            $limit
+        ) );
+    }
+
+    /**
+     * Read a customer's stored identity into the shape WC_Order::set_address() wants.
+     *
+     * Reading it off the user rather than generating it here is what keeps the
+     * operation idempotent and keeps a customer's orders agreeing with each other.
+     * Generate per order instead and a customer with six orders ends up with six
+     * different names, which destroys the repeat-customer relationship the store is
+     * meant to have.
+     *
+     * @return array|false False when the customer has nothing usable to copy.
+     */
+    private function identity_from_user( $user_id ) {
+        $address = array();
+
+        foreach ( array( 'first_name', 'last_name', 'address_1', 'city', 'state', 'postcode', 'country', 'email', 'phone' ) as $key ) {
+            $address[ $key ] = (string) get_user_meta( $user_id, 'billing_' . $key, true );
+        }
+
+        foreach ( array( 'first_name', 'last_name', 'address_1', 'city', 'postcode', 'country', 'email' ) as $key ) {
+            if ( '' === trim( $address[ $key ] ) ) {
+                return false;
+            }
+        }
+
+        $address['company']   = '';
+        $address['address_2'] = '';
+
+        return $address;
+    }
+
+    /**
+     * Compose a one-off identity for an order with no usable customer behind it.
+     *
+     * @return array|false
+     */
+    private function fresh_address_set() {
+        $identity = $this->generate_identity();
+        $row      = $this->random_address_row();
+
+        if ( is_wp_error( $identity ) || ! $row ) {
+            return false;
+        }
+
+        return array(
+            'first_name' => $identity['given'],
+            'last_name'  => $identity['surname'],
+            'company'    => '',
+            'address_1'  => $row->streetaddress,
+            'address_2'  => '',
+            'city'       => $row->city,
+            'state'      => $row->state,
+            'postcode'   => $row->zipcode,
+            'country'    => $row->country,
+            'email'      => $identity['email'],
+            'phone'      => $this->random_phone( $row->country ),
+        );
+    }
+
+    /**
+     * Copy each order's customer identity onto the order itself.
+     *
+     * Written for the sandbox, where 54,484 orders are perfectly good apart from
+     * their identity columns. Deleting and regenerating them costs hours and loses
+     * the dates, totals, line items and status mix that are already right; this
+     * rewrites the four columns that are wrong and leaves everything else alone.
+     *
+     * Goes through the CRUD layer rather than straight SQL. Direct UPDATEs would be
+     * perhaps a hundred times faster, but the order data lives in the orders table,
+     * a synced copy in post meta, and again in the analytics lookup tables - and
+     * hand-maintaining that fan-out is precisely the class of mistake that produced
+     * the defect this whole change is repairing. An hour of unattended CRUD is the
+     * cheaper trade.
+     *
+     * Run `wp wcos refresh-customers` first: this copies what the customer record
+     * currently says, so customers still carrying the old identity would have it
+     * faithfully copied onto their orders.
+     *
+     * @param int  $limit    Orders to process this invocation.
+     * @param int  $after_id Resume point; only orders with a greater ID are touched.
+     * @param bool $dry_run  Report without writing.
+     *
+     * @return array Stats, including last_id for the next invocation.
+     */
+    public function reidentify_orders( $limit = 2000, $after_id = 0, $dry_run = false ) {
+        $stats = array(
+            'examined'     => 0,
+            'updated'      => 0,
+            'skipped'      => 0,
+            'from_guest'   => 0,
+            'filled_blank' => 0,
+            'last_id'      => (int) $after_id,
+            'customer_ids' => array(),
+            'samples'      => array(),
+        );
+
+        foreach ( $this->order_ids_after( $after_id, $limit ) as $order_id ) {
+            $stats['examined']++;
+            $stats['last_id'] = (int) $order_id;
+
+            $order = wc_get_order( $order_id );
+
+            if ( ! $order ) {
+                $stats['skipped']++;
+                continue;
+            }
+
+            $customer_id = (int) $order->get_customer_id();
+
+            // Recorded so a dry run answers "what is behind the blank orders?"
+            // without anyone having to write the join by hand.
+            $bucket = $customer_id > 1 ? 'customer' : ( 1 === $customer_id ? 'admin(1)' : 'guest(0)' );
+            $stats['customer_ids'][ $bucket ] = ( $stats['customer_ids'][ $bucket ] ?? 0 ) + 1;
+
+            $address = $customer_id ? $this->identity_from_user( $customer_id ) : false;
+
+            if ( ! $address ) {
+                $address = $this->fresh_address_set();
+                $stats['from_guest']++;
+            }
+
+            if ( ! $address ) {
+                $stats['skipped']++;
+                continue;
+            }
+
+            $was_blank = '' === trim( (string) $order->get_billing_address_1() );
+
+            if ( $was_blank ) {
+                $stats['filled_blank']++;
+            }
+
+            if ( count( $stats['samples'] ) < 5 ) {
+                $stats['samples'][] = sprintf(
+                    '#%d  %s -> %s, %s, %s',
+                    $order_id,
+                    $order->get_billing_last_name() ? $order->get_billing_last_name() : '(blank)',
+                    $address['last_name'],
+                    $address['email'],
+                    $address['phone']
+                );
+            }
+
+            if ( $dry_run ) {
+                continue;
+            }
+
+            $order->set_address( $address, 'billing' );
+            $order->set_address( $address, 'shipping' );
+            $order->save();
+
+            $stats['updated']++;
+        }
+
+        return $stats;
+    }
+
+    /**
+     * How many customers still carry a given billing surname.
+     *
+     * Used to warn when reidentify-orders is about to faithfully copy the very
+     * names it is supposed to be replacing.
+     */
+    public function count_customers_named( $last_name ) {
+        return count( get_users( array(
+            'role'       => 'Customer',
+            'fields'     => 'ID',
+            'meta_key'   => 'billing_last_name',
+            'meta_value' => $last_name,
+        ) ) );
+    }
+
     /**
      * Measure the acceptance criteria from the defect report.
      *
@@ -1461,6 +1664,153 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
             }
 
             WP_CLI::success( sprintf( '%d fixture rows in place.', $loaded ) );
+        }
+
+        /**
+         * Copy each order's customer identity onto the order itself.
+         *
+         * Repairs orders that already exist instead of deleting and regenerating
+         * them: dates, totals, line items and status mix are kept, and only the
+         * identity columns are rewritten. Run `wp wcos refresh-customers` first,
+         * or this will faithfully copy the names you are trying to replace.
+         *
+         * Batched and resumable. Each invocation processes --batch orders and
+         * remembers where it stopped, so a process killed by the host picks up
+         * rather than starting over. Re-run until it reports 0 examined.
+         *
+         * ## OPTIONS
+         *
+         * [--dry-run]
+         * : Report what would change without writing. Also prints which customer
+         *   IDs sit behind the orders, which is the quickest way to see what the
+         *   blank-address orders were actually attached to.
+         *
+         * [--batch=<n>]
+         * : Orders to process this invocation. Default 2000.
+         *
+         * [--reset]
+         * : Forget the stored resume point and start from the first order.
+         *
+         * [--all]
+         * : Keep going until every order has been processed, rather than stopping
+         *   after one batch. Only do this where the host will not kill it.
+         *
+         * [--yes]
+         * : Skip the confirmation prompt.
+         *
+         * ## EXAMPLES
+         *
+         *     wp wcos reidentify-orders --dry-run
+         *     wp wcos reidentify-orders --batch=2000 --yes
+         *     wp wcos reidentify-orders --all --yes
+         */
+        public function reidentify_orders( $args, $assoc_args ) {
+            $dry_run = isset( $assoc_args['dry-run'] );
+            $batch   = isset( $assoc_args['batch'] ) ? max( 1, absint( $assoc_args['batch'] ) ) : 2000;
+            $all     = isset( $assoc_args['all'] );
+
+            if ( isset( $assoc_args['reset'] ) ) {
+                delete_option( 'wcos_reidentify_after_id' );
+                WP_CLI::log( 'Resume point cleared.' );
+            }
+
+            $stale = $this->simulator()->count_customers_named( 'Example' );
+
+            if ( $stale > 0 ) {
+                WP_CLI::warning( sprintf(
+                    '%d customers are still named "Example". This command copies what the customer record says, so run `wp wcos refresh-customers --last-name=Example` first.',
+                    $stale
+                ) );
+            }
+
+            if ( ! $dry_run ) {
+                // Blocks mail for this process only. Saving tens of thousands of
+                // orders should not fire customer email, and "should not" is not
+                // the standard to hold a one-way operation to.
+                add_filter( 'pre_wp_mail', '__return_false', PHP_INT_MAX );
+
+                WP_CLI::confirm(
+                    sprintf( 'Rewrite identity fields on orders, in batches of %d. Continue?', $batch ),
+                    $assoc_args
+                );
+            }
+
+            $after_id = (int) get_option( 'wcos_reidentify_after_id', 0 );
+            $totals   = array( 'examined' => 0, 'updated' => 0, 'skipped' => 0, 'from_guest' => 0, 'filled_blank' => 0 );
+            $buckets  = array();
+            $samples  = array();
+
+            do {
+                $stats = $this->simulator()->reidentify_orders( $batch, $after_id, $dry_run );
+
+                foreach ( array_keys( $totals ) as $key ) {
+                    $totals[ $key ] += $stats[ $key ];
+                }
+
+                foreach ( $stats['customer_ids'] as $bucket => $count ) {
+                    $buckets[ $bucket ] = ( $buckets[ $bucket ] ?? 0 ) + $count;
+                }
+
+                if ( ! $samples ) {
+                    $samples = $stats['samples'];
+                }
+
+                if ( ! $stats['examined'] ) {
+                    break;
+                }
+
+                $after_id = $stats['last_id'];
+
+                if ( ! $dry_run ) {
+                    update_option( 'wcos_reidentify_after_id', $after_id, false );
+                }
+
+                WP_CLI::log( sprintf(
+                    '  ... %d examined, %d updated, through order #%d',
+                    $totals['examined'],
+                    $totals['updated'],
+                    $after_id
+                ) );
+            } while ( $all );
+
+            if ( $samples ) {
+                WP_CLI::log( '' );
+                WP_CLI::log( 'Sample of the change:' );
+                foreach ( $samples as $sample ) {
+                    WP_CLI::log( '  ' . $sample );
+                }
+            }
+
+            if ( $buckets ) {
+                WP_CLI::log( '' );
+                WP_CLI::log( 'Customer link on the orders seen: ' . http_build_query( $buckets, '', ', ' ) );
+            }
+
+            WP_CLI::log( '' );
+
+            $summary = sprintf(
+                '%d examined, %d %s, %d had a blank address filled in, %d had no usable customer and got a fresh identity, %d skipped.',
+                $totals['examined'],
+                $dry_run ? $totals['examined'] - $totals['skipped'] : $totals['updated'],
+                $dry_run ? 'would be updated' : 'updated',
+                $totals['filled_blank'],
+                $totals['from_guest'],
+                $totals['skipped']
+            );
+
+            if ( $dry_run ) {
+                WP_CLI::success( 'Dry run. ' . $summary );
+                return;
+            }
+
+            WP_CLI::success( $summary );
+
+            if ( ! $all && $totals['examined'] ) {
+                WP_CLI::log( sprintf(
+                    'Resume point saved at order #%d. Re-run to continue, or pass --all.',
+                    $after_id
+                ) );
+            }
         }
 
         /**

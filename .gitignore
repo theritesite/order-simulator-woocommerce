@@ -1,5 +1,6 @@
 /node_modules
 /order-simulator-woocommerce
+/zip_files
 yarn-error.log
 #yarn.lock
 #package.json
