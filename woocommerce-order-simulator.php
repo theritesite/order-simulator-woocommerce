@@ -3,7 +3,7 @@
   * Plugin Name: Order Simulator for WooCommerce
   * Plugin URI: http://www.75nineteen.com
   * Description: Automate orders to generate WooCommerce storefronts at scale for testing purposes.
-  * Version: 1.2.2
+  * Version: 1.2.3
   * Author: 75nineteen Media LLC
   * Author URI: http://www.75nineteen.com
 
@@ -1301,9 +1301,34 @@ PRIMARY KEY  (number)
      * different names, which destroys the repeat-customer relationship the store is
      * meant to have.
      *
-     * @return array|false False when the customer has nothing usable to copy.
+     * TWO GUARDS, both learned the hard way on the sandbox.
+     *
+     * ROLE. An order whose customer_id is not a customer account is, here, a
+     * broken order rather than somebody's order. create_user() used to return a
+     * WP_Error, and `absint( $wp_error )` casts an object to int 1 - so 17,564 of
+     * the sandbox's 54,484 orders point at user 1, the administrator. That is not
+     * a customer relationship, it is the fingerprint of the bug.
+     *
+     * REACHABLE EMAIL. User 1 on the sandbox turned out to hold a complete billing
+     * address ending in a real, deliverable gmail.com inbox. Inheriting it would
+     * have written a real person's name and email onto a third of the store - test
+     * data that can receive mail, which is the one thing the 2020 scrub existed to
+     * prevent. So an address is only copied if its email sits on a domain that
+     * cannot receive mail. This guard is deliberately about the address, not about
+     * who owns it: it holds for any account that acquires a real email later.
+     *
+     * Failing either guard is not an error. The order simply gets a fresh
+     * synthetic identity, which is what it should have had all along.
+     *
+     * @return array|false False when the customer has nothing safe to copy.
      */
     private function identity_from_user( $user_id ) {
+        $user = get_userdata( $user_id );
+
+        if ( ! $user || ! in_array( 'customer', (array) $user->roles, true ) ) {
+            return false;
+        }
+
         $address = array();
 
         foreach ( array( 'first_name', 'last_name', 'address_1', 'city', 'state', 'postcode', 'country', 'email', 'phone' ) as $key ) {
@@ -1316,10 +1341,50 @@ PRIMARY KEY  (number)
             }
         }
 
+        if ( ! self::is_unreachable_email( $address['email'] ) ) {
+            return false;
+        }
+
         $address['company']   = '';
         $address['address_2'] = '';
 
         return $address;
+    }
+
+    /**
+     * Whether an email address is guaranteed undeliverable.
+     *
+     * True only for the reserved names in email_domains() and for anything under
+     * a TLD that can never be delegated: RFC 2606 reserves .example, .test and
+     * .invalid, RFC 6761 reiterates .test and .invalid, and .localhost never
+     * leaves the host. Everything else - including any ordinary .com - is treated
+     * as reachable, because the cost of being wrong is real mail to a real person.
+     */
+    public static function is_unreachable_email( $email ) {
+        $email = strtolower( trim( (string) $email ) );
+        $at    = strrpos( $email, '@' );
+
+        if ( false === $at ) {
+            return false;
+        }
+
+        $domain = substr( $email, $at + 1 );
+
+        if ( '' === $domain ) {
+            return false;
+        }
+
+        if ( isset( self::email_domains()[ $domain ] ) ) {
+            return true;
+        }
+
+        foreach ( array( '.example', '.test', '.invalid', '.localhost' ) as $tld ) {
+            if ( $domain === substr( $tld, 1 ) || substr( $domain, -strlen( $tld ) ) === $tld ) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -1381,6 +1446,7 @@ PRIMARY KEY  (number)
             'updated'      => 0,
             'skipped'      => 0,
             'from_guest'   => 0,
+            'detached'     => 0,
             'filled_blank' => 0,
             'last_id'      => (int) $after_id,
             'customer_ids' => array(),
@@ -1405,11 +1471,18 @@ PRIMARY KEY  (number)
             $bucket = $customer_id > 1 ? 'customer' : ( 1 === $customer_id ? 'admin(1)' : 'guest(0)' );
             $stats['customer_ids'][ $bucket ] = ( $stats['customer_ids'][ $bucket ] ?? 0 ) + 1;
 
-            $address = $customer_id ? $this->identity_from_user( $customer_id ) : false;
+            $address  = $customer_id ? $this->identity_from_user( $customer_id ) : false;
+            $detached = false;
 
             if ( ! $address ) {
                 $address = $this->fresh_address_set();
                 $stats['from_guest']++;
+
+                // The order carries a synthetic identity belonging to no account,
+                // so leaving customer_id pointing at one is a lie the admin order
+                // list will happily repeat - on the sandbox it would credit 17,564
+                // orders to the administrator. Guest is the truthful answer.
+                $detached = $customer_id > 0;
             }
 
             if ( ! $address ) {
@@ -1440,6 +1513,12 @@ PRIMARY KEY  (number)
 
             $order->set_address( $address, 'billing' );
             $order->set_address( $address, 'shipping' );
+
+            if ( $detached ) {
+                $order->set_customer_id( 0 );
+                $stats['detached']++;
+            }
+
             $order->save();
 
             $stats['updated']++;
@@ -1909,7 +1988,7 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
             }
 
             $after_id = (int) get_option( 'wcos_reidentify_after_id', 0 );
-            $totals   = array( 'examined' => 0, 'updated' => 0, 'skipped' => 0, 'from_guest' => 0, 'filled_blank' => 0 );
+            $totals   = array( 'examined' => 0, 'updated' => 0, 'skipped' => 0, 'from_guest' => 0, 'detached' => 0, 'filled_blank' => 0 );
             $buckets  = array();
             $samples  = array();
 
@@ -1962,12 +2041,13 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
             WP_CLI::log( '' );
 
             $summary = sprintf(
-                '%d examined, %d %s, %d had a blank address filled in, %d had no usable customer and got a fresh identity, %d skipped.',
+                '%d examined, %d %s, %d had a blank address filled in, %d had no safely usable customer and got a fresh identity, %d detached from the account they were wrongly credited to, %d skipped.',
                 $totals['examined'],
                 $dry_run ? $totals['examined'] - $totals['skipped'] : $totals['updated'],
                 $dry_run ? 'would be updated' : 'updated',
                 $totals['filled_blank'],
                 $totals['from_guest'],
+                $totals['detached'],
                 $totals['skipped']
             );
 
