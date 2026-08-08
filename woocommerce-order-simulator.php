@@ -3,7 +3,7 @@
   * Plugin Name: Order Simulator for WooCommerce
   * Plugin URI: http://www.75nineteen.com
   * Description: Automate orders to generate WooCommerce storefronts at scale for testing purposes.
-  * Version: 1.2.1
+  * Version: 1.2.2
   * Author: 75nineteen Media LLC
   * Author URI: http://www.75nineteen.com
 
@@ -1814,6 +1814,8 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
          *
          *     wp wcos clean-options --dry-run
          *     wp wcos clean-options
+         *
+         * @subcommand clean-options
          */
         public function clean_options( $args, $assoc_args ) {
             $dry_run = isset( $assoc_args['dry-run'] );
@@ -1872,6 +1874,8 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
          *     wp wcos reidentify-orders --dry-run
          *     wp wcos reidentify-orders --batch=2000 --yes
          *     wp wcos reidentify-orders --all --yes
+         *
+         * @subcommand reidentify-orders
          */
         public function reidentify_orders( $args, $assoc_args ) {
             $dry_run = isset( $assoc_args['dry-run'] );
@@ -2000,6 +2004,8 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
          * ## EXAMPLES
          *
          *     wp wcos refresh-customers --last-name=Example
+         *
+         * @subcommand refresh-customers
          */
         public function refresh_customers( $args, $assoc_args ) {
             $last_name = isset( $assoc_args['last-name'] ) ? $assoc_args['last-name'] : '';

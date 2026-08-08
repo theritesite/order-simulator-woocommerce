@@ -144,6 +144,11 @@ maiden names, 10,000 emails, 9,200 phone numbers and 5,840 cities.
     wp wcos reidentify-orders --dry-run             # see what would change on orders
     wp wcos reidentify-orders --batch=2000 --yes    # repair a batch of orders
 
+Subcommand names use hyphens. WP-CLI derives a subcommand from the method name
+verbatim, so the hyphenated forms need an explicit `@subcommand` annotation -
+added in 1.2.2. A 1.2.1 build in the field only answers to the underscore forms
+(`wcos clean_options`, `wcos refresh_customers`, `wcos reidentify_orders`).
+
 ## The settings screen used to ignore edits
 
 Fixed in 1.2.1. Change "Orders per Hour", hit Save, and the old number came back.
