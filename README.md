@@ -80,9 +80,11 @@ RFC 2606 reserves `example.com/.net/.org` and the `.example`, `.test` and
 - both are ordinary registrable `.com` names owned by someone else, so a store
 with mail enabled would aim real messages at a real domain.
 
-**Phone numbers** were the worst of the lot: one value, `555-555-5555`, across all
-10,000 rows. Zero selectivity, and `555-555-5555` is not even in the range that is
-actually reserved. They are now generated per order in the country's own format:
+**Phone numbers** were the worst of the lot: 389 values across 10,000 rows, with
+`555-555-5555` alone on 21% of them (2,141 rows) and the rest split across six
+other country-shaped all-fives variants plus a long thin tail. Near-zero
+selectivity, and `555-555-5555` is not even in the range that is actually
+reserved. They are now generated per order in the country's own format:
 
 | | Range | Status |
 | --- | --- | --- |
@@ -133,7 +135,11 @@ Replayed over 50,000 orders through the plugin's own generator:
 | Rows on a domain that is not RFC-reserved | 0 | 0 |
 
 For reference, the fixture itself now carries 4,308 distinct surnames, 4,308
-maiden names, 10,000 emails, 9,200 phone numbers and 5,840 cities.
+maiden names, 10,000 emails, 9,200 phone numbers and 5,840 cities. The
+`username` column is also regenerated on all 10,000 rows, as the email local
+part rather than the old free-standing username corpus; the plugin no longer
+reads this column at all, and it is retained only so the fixture's schema is
+unchanged.
 
 ### Other commands
 
