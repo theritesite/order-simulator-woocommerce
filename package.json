@@ -1,28 +1,21 @@
 {
   "name": "order-simulator-woocommerce",
-  "version": "1.0.0",
-  "main": "index.js",
+  "version": "1.2.4",
   "repository": "git@github.com:theritesite/order-simulator-woocommerce.git",
   "author": "Parker Mathewson <theritesites@gmail.com>",
   "license": "GPL-2.0",
-	"files": [
-		"fakenames.sql",
-		"woocommerce-order-simulator.php",
-		"README.txt",
-		"README.md"
-	],
   "scripts": {
-    "start-m": "wp-scripts build --mode=development --env NODE_ENV=development --env LOC=m --watch",
-    "build-m": "wp-scripts build --mode=production --env NODE_ENV=production --env LOC=m",
-    "start-c": "wp-scripts build --mode=development --env NODE_ENV=development --env LOC=c --watch",
-    "build-c": "wp-scripts build --mode=production --env NODE_ENV=production --env LOC=c",
-    "start-m1": "wp-scripts build --mode=development --env NODE_ENV=development --env LOC=m1 --watch",
-    "build-m1": "wp-scripts build --mode=production --env NODE_ENV=production --env LOC=m1",
-    "plugin-zip": "wp-scripts plugin-zip"
+    "clean": "rm -rf zip_files/*",
+    "build": "echo \"[order-simulator] no compile step - the payload is plain PHP\"",
+    "package": "npm run clean && node ../trs-package.js"
   },
-	"devDependencies": {
-		"@wordpress/scripts": "^27",
-		"copy-webpack-plugin": "^12.0.2",
-		"webpack-cli": "^4.10.0"
-	}
+  "trsPackage": {
+    "slug": "order-simulator-woocommerce",
+    "include": [
+      "fakenames.sql",
+      "woocommerce-order-simulator.php",
+      "class-wc-settings-order-simulator.php",
+      "README.md"
+    ]
+  }
 }
