@@ -4,8 +4,8 @@
   * Plugin URI: http://www.75nineteen.com
   * Description: Automate orders to generate WooCommerce storefronts at scale for testing purposes.
   * Version: 1.2.5
-  * Author: 75nineteen Media LLC
-  * Author URI: http://www.75nineteen.com
+  * Author: TheRiteSites
+  * Author URI: https://www.theritesites.com
 
   * Copyright 2015 75nineteen Media LLC.  (email : scott@75nineteen.com)
   *
