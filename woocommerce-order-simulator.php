@@ -3,7 +3,7 @@
   * Plugin Name: Order Simulator for WooCommerce
   * Plugin URI: http://www.75nineteen.com
   * Description: Automate orders to generate WooCommerce storefronts at scale for testing purposes.
-  * Version: 1.2.4
+  * Version: 1.2.5
   * Author: 75nineteen Media LLC
   * Author URI: http://www.75nineteen.com
 
@@ -57,6 +57,41 @@
  *
  * Verify with `wp wcos verify`, which measures the acceptance criteria from the
  * defect report directly.
+ */
+
+/**
+ * DERIVED FIELDS - what 1.2.5 changed and why.
+ *
+ * See order-simulator-derived-fields.md (todos/pitch-midnight/ in the parker-context
+ * repo). `reidentify-orders` rewrote an order's identity across the address table
+ * and the individual meta fields and stopped there - three places kept their own
+ * copy of that identity and were left holding the pre-repair data:
+ *
+ * 1. `_billing_address_index` / `_shipping_address_index`. WooCommerce's own
+ *    denormalized copy of each address, and what order search actually reads.
+ *    Measured stale on 65.7% of rows after a `reidentify-orders --all` pass -
+ *    16,835 of them still carrying a real, deliverable inbox in that field after
+ *    the address columns reported clean. `set_address()` + `save()` does not
+ *    reliably regenerate it on this store. `reidentify_orders()` now writes both
+ *    keys itself, in WooCommerce's own format (`implode(' ', $order->get_address())`),
+ *    read back after `set_address()` so it reflects the new identity.
+ *
+ * 2. `wp_users` - user_email, display_name, user_nicename. `refresh-customers`
+ *    updated billing meta but left the account row alone, and WooCommerce's
+ *    legacy `search_orders()` searches accounts too. `refresh_customer_identities()`
+ *    now syncs the account row through `sync_user_account()`, guarded the way the
+ *    by-hand repair was: never user 1, never an account outside the `customer`
+ *    role. `user_login` is deliberately left alone - existing values are
+ *    synthetic, leak nothing, and WordPress treats logins as effectively
+ *    immutable. Billing emails are not unique across customers, so collisions
+ *    are resolved the same way the by-hand repair resolved them: `.N` inserted
+ *    before the `@`.
+ *
+ * 3. The check that would have caught this. `wp wcos verify` measured only the
+ *    source columns, so the repair reported "deliverable emails: 17,564 -> 0"
+ *    and was believed, because nothing looked at the copy. `measure_realism()`
+ *    now also counts address-index rows that disagree with their source columns
+ *    and customer accounts where `user_email` disagrees with `billing_email`.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -732,6 +767,69 @@ PRIMARY KEY  (number)
     }
 
     /**
+     * Bring wp_users in line with a refreshed identity.
+     *
+     * Guards match identity_from_user(): never the administrator, never an
+     * account outside the customer role. create_user() never needs this - it
+     * sets user_email correctly at insert time from the same identity that goes
+     * into billing meta - so this only runs from the repair path, where an
+     * account already exists under its old identity.
+     */
+    private function sync_user_account( $user_id, $identity ) {
+        if ( 1 === (int) $user_id ) {
+            return;
+        }
+
+        $user = get_userdata( $user_id );
+
+        if ( ! $user || ! in_array( 'customer', (array) $user->roles, true ) ) {
+            return;
+        }
+
+        $display_name = trim( $identity['given'] . ' ' . $identity['surname'] );
+
+        wp_update_user( array(
+            'ID'            => $user_id,
+            'user_email'    => $this->unique_user_email( $identity['email'], $user_id ),
+            'display_name'  => $display_name,
+            'user_nicename' => sanitize_title( $display_name ),
+        ) );
+
+        // user_login deliberately left alone - existing values are synthetic,
+        // leak nothing, and WordPress treats logins as effectively immutable.
+    }
+
+    /**
+     * Resolve an email collision the way the by-hand repair resolved one: insert
+     * ".N" before the @ until the address is free. Billing emails are not unique
+     * across customers - the by-hand repair hit 124 collisions in 8,780 accounts,
+     * so anything assuming one account per email is wrong.
+     */
+    private function unique_user_email( $email, $user_id ) {
+        $at = strrpos( $email, '@' );
+
+        if ( false === $at ) {
+            return $email;
+        }
+
+        $local     = substr( $email, 0, $at );
+        $domain    = substr( $email, $at );
+        $candidate = $email;
+        $n         = 1;
+
+        while ( true ) {
+            $existing = email_exists( $candidate );
+
+            if ( ! $existing || (int) $existing === (int) $user_id ) {
+                return $candidate;
+            }
+
+            $candidate = $local . '.' . $n . $domain;
+            $n++;
+        }
+    }
+
+    /**
      * Create a customer account with a synthetic identity.
      *
      * @return int|WP_Error
@@ -1242,13 +1340,18 @@ PRIMARY KEY  (number)
                 continue;
             }
 
-            // The account keeps its email so the login still resolves; the address
-            // email is what a lookup feature searches, and that one is regenerated
-            // from the new name.
             $this->write_address_meta( $user_id, $identity, $address );
 
             update_user_meta( $user_id, 'first_name', $identity['given'] );
             update_user_meta( $user_id, 'last_name', $identity['surname'] );
+
+            // wp_users keeps its own copy of email and display name, and
+            // WooCommerce's legacy search_orders() searches accounts as well as
+            // orders - so a customer refreshed above but left with a stale
+            // user_email is still found by their old identity. Same defect shape
+            // as the order address index: the source column changes, the derived
+            // copy does not.
+            $this->sync_user_account( $user_id, $identity );
 
             $updated++;
 
@@ -1514,6 +1617,17 @@ PRIMARY KEY  (number)
             $order->set_address( $address, 'billing' );
             $order->set_address( $address, 'shipping' );
 
+            // WooCommerce keeps a denormalized copy of each address in
+            // _billing_address_index / _shipping_address_index - what order search
+            // actually reads - and set_address() + save() does not regenerate it
+            // reliably on this store: measured 65.7% of rows stale after the first
+            // reidentify-orders pass, 16,835 of them still carrying a real,
+            // deliverable inbox after the address columns reported clean. Format
+            // is WooCommerce's own (implode(' ', $order->get_address())), read
+            // back after set_address() so it reflects the identity just set.
+            $order->update_meta_data( '_billing_address_index', implode( ' ', $order->get_address( 'billing' ) ) );
+            $order->update_meta_data( '_shipping_address_index', implode( ' ', $order->get_address( 'shipping' ) ) );
+
             if ( $detached ) {
                 $order->set_customer_id( 0 );
                 $stats['detached']++;
@@ -1621,6 +1735,78 @@ PRIMARY KEY  (number)
     }
 
     /**
+     * Order rows where _billing_address_index / _shipping_address_index disagree
+     * with the address columns they are supposed to be a copy of.
+     *
+     * The check order-simulator-derived-fields.md says was missing: the defect it
+     * describes survived a full verification session because every check queried
+     * the source columns, and this one queries the copy instead. Null when the
+     * HPOS meta table is not present - there is nothing to compare on a
+     * legacy-only install.
+     */
+    private function count_stale_address_index() {
+        global $wpdb;
+
+        $addresses  = $wpdb->prefix . 'wc_order_addresses';
+        $order_meta = $wpdb->prefix . 'wc_orders_meta';
+
+        if ( $wpdb->get_var( "SHOW TABLES LIKE '{$order_meta}'" ) !== $order_meta ) {
+            return null;
+        }
+
+        $billing = (int) $wpdb->get_var(
+            "SELECT COUNT(*)
+             FROM   {$addresses} a
+             LEFT JOIN {$order_meta} m
+                    ON  m.order_id = a.order_id AND m.meta_key = '_billing_address_index'
+             WHERE  a.address_type = 'billing'
+               AND  ( m.meta_value IS NULL
+                      OR m.meta_value <> CONCAT_WS( ' ', a.first_name, a.last_name, a.company,
+                          a.address_1, a.address_2, a.city, a.state, a.postcode, a.country,
+                          a.email, a.phone ) )"
+        );
+
+        $shipping = (int) $wpdb->get_var(
+            "SELECT COUNT(*)
+             FROM   {$addresses} a
+             LEFT JOIN {$order_meta} m
+                    ON  m.order_id = a.order_id AND m.meta_key = '_shipping_address_index'
+             WHERE  a.address_type = 'shipping'
+               AND  ( m.meta_value IS NULL
+                      OR m.meta_value <> CONCAT_WS( ' ', a.first_name, a.last_name, a.company,
+                          a.address_1, a.address_2, a.city, a.state, a.postcode, a.country,
+                          a.phone ) )"
+        );
+
+        return $billing + $shipping;
+    }
+
+    /**
+     * Customer accounts where wp_users.user_email has drifted from billing_email.
+     *
+     * Same shape of defect as the address index: a repair that updates billing
+     * meta but not the account row leaves WooCommerce's legacy search_orders(),
+     * which searches accounts too, matching the old identity. Excludes user 1 and
+     * anything outside the customer role, same as the by-hand repair.
+     */
+    private function count_stale_user_emails() {
+        global $wpdb;
+
+        return (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*)
+             FROM   {$wpdb->users} u
+             JOIN   {$wpdb->usermeta} email ON email.user_id = u.ID AND email.meta_key = 'billing_email'
+             JOIN   {$wpdb->usermeta} caps  ON caps.user_id = u.ID AND caps.meta_key = %s
+             WHERE  u.ID <> 1
+               AND  email.meta_value <> ''
+               AND  email.meta_value <> u.user_email
+               AND  caps.meta_value LIKE %s",
+            $wpdb->prefix . 'capabilities',
+            '%"customer"%'
+        ) );
+    }
+
+    /**
      * Measure the acceptance criteria from the defect report.
      *
      * @return array criterion => array(label, value, target, pass)
@@ -1716,6 +1902,9 @@ PRIMARY KEY  (number)
 
         $top_domain_share = $domain_rows ? ( 100 * (int) $domain_rows[0]->c / $rows ) : 0.0;
 
+        $stale_index  = $this->count_stale_address_index();
+        $stale_emails = $this->count_stale_user_emails();
+
         // Anything outside the reserved set could carry mail off the box.
         $reserved   = self::email_domains();
         $escapable  = 0;
@@ -1742,6 +1931,18 @@ PRIMARY KEY  (number)
             'deliverable'   => array( 'label' => 'Rows on a domain that is not RFC-reserved', 'value' => $escapable, 'target' => '0', 'pass' => 0 === $escapable ),
             'distinct_first'=> array( 'label' => 'Distinct given names', 'value' => (int) $totals->distinct_first, 'target' => '-', 'pass' => null ),
             'distinct_email'=> array( 'label' => 'Distinct emails', 'value' => (int) $totals->distinct_email, 'target' => '-', 'pass' => null ),
+            'address_index' => array(
+                'label'  => 'Order rows where the address index disagrees with the address columns',
+                'value'  => null === $stale_index ? 'n/a (no HPOS meta table)' : $stale_index,
+                'target' => '0',
+                'pass'   => null === $stale_index ? null : 0 === $stale_index,
+            ),
+            'user_email_sync' => array(
+                'label'  => 'Customer accounts where user_email disagrees with billing_email',
+                'value'  => $stale_emails,
+                'target' => '0',
+                'pass'   => 0 === $stale_emails,
+            ),
         );
     }
 
