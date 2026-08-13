@@ -1519,6 +1519,37 @@ PRIMARY KEY  (number)
     }
 
     /**
+     * Write the address-index meta keys directly, bypassing WC_Data's meta API.
+     *
+     * WC_Data::update_meta_data() only replaces an existing row when given its
+     * $meta_id; without one - the normal case for a key the object never loaded -
+     * it falls through to add_meta_data(), which appends a new WC_Meta_Data
+     * object rather than finding and updating the old one. On save() that becomes
+     * an INSERT, not an UPDATE, so the previous row is never deleted. Confirmed
+     * directly on the sandbox: one order accumulated four rows for
+     * _billing_address_index alone across two reidentify passes, and a plain
+     * SELECT then returns whichever duplicate sorts first - not necessarily the
+     * current one. Delete-then-insert guarantees exactly one row per key.
+     */
+    private function write_address_index_meta( $order_id, $billing_index, $shipping_index ) {
+        global $wpdb;
+
+        $table = $wpdb->prefix . 'wc_orders_meta';
+
+        foreach ( array(
+            '_billing_address_index'  => $billing_index,
+            '_shipping_address_index' => $shipping_index,
+        ) as $key => $value ) {
+            $wpdb->delete( $table, array( 'order_id' => $order_id, 'meta_key' => $key ) );
+            $wpdb->insert( $table, array(
+                'order_id'   => $order_id,
+                'meta_key'   => $key,
+                'meta_value' => $value,
+            ) );
+        }
+    }
+
+    /**
      * Copy each order's customer identity onto the order itself.
      *
      * Written for the sandbox, where 54,484 orders are perfectly good apart from
@@ -1526,12 +1557,14 @@ PRIMARY KEY  (number)
      * the dates, totals, line items and status mix that are already right; this
      * rewrites the four columns that are wrong and leaves everything else alone.
      *
-     * Goes through the CRUD layer rather than straight SQL. Direct UPDATEs would be
-     * perhaps a hundred times faster, but the order data lives in the orders table,
-     * a synced copy in post meta, and again in the analytics lookup tables - and
-     * hand-maintaining that fan-out is precisely the class of mistake that produced
-     * the defect this whole change is repairing. An hour of unattended CRUD is the
-     * cheaper trade.
+     * Goes through the CRUD layer for the props and for customer_id - direct
+     * UPDATEs would be perhaps a hundred times faster, but the order data lives in
+     * the orders table, a synced copy in post meta, and again in the analytics
+     * lookup tables, and hand-maintaining that fan-out is precisely the class of
+     * mistake that produced the defect this whole change is repairing. The two
+     * address-index meta keys are the one deliberate exception - see
+     * write_address_index_meta() for why the CRUD layer's own meta API is not
+     * safe for them.
      *
      * Run `wp wcos refresh-customers` first: this copies what the customer record
      * currently says, so customers still carrying the old identity would have it
@@ -1617,23 +1650,37 @@ PRIMARY KEY  (number)
             $order->set_address( $address, 'billing' );
             $order->set_address( $address, 'shipping' );
 
-            // WooCommerce keeps a denormalized copy of each address in
-            // _billing_address_index / _shipping_address_index - what order search
-            // actually reads - and set_address() + save() does not regenerate it
-            // reliably on this store: measured 65.7% of rows stale after the first
-            // reidentify-orders pass, 16,835 of them still carrying a real,
-            // deliverable inbox after the address columns reported clean. Format
-            // is WooCommerce's own (implode(' ', $order->get_address())), read
-            // back after set_address() so it reflects the identity just set.
-            $order->update_meta_data( '_billing_address_index', implode( ' ', $order->get_address( 'billing' ) ) );
-            $order->update_meta_data( '_shipping_address_index', implode( ' ', $order->get_address( 'shipping' ) ) );
-
             if ( $detached ) {
                 $order->set_customer_id( 0 );
                 $stats['detached']++;
             }
 
             $order->save();
+
+            // WooCommerce keeps a denormalized copy of each address in
+            // _billing_address_index / _shipping_address_index - what order search
+            // actually reads - and set_address() + save() does not regenerate it
+            // reliably on this store: measured 65.7% of rows stale after the first
+            // reidentify-orders pass, 16,835 of them still carrying a real,
+            // deliverable inbox after the address columns reported clean.
+            //
+            // update_meta_data() + save() is NOT the fix, even though it looks
+            // like one - confirmed directly on the sandbox. Without a $meta_id,
+            // WC_Data::update_meta_data() always falls through to add_meta_data(),
+            // which appends a new WC_Meta_Data object; on save, that becomes an
+            // INSERT, not an UPDATE, and the previous row is never deleted. One
+            // order accumulated FOUR rows for _billing_address_index alone across
+            // two reidentify passes, and a plain read then returns whichever
+            // duplicate sorts first - not necessarily the current one. Written
+            // directly instead: delete any existing rows for these two keys, then
+            // insert exactly one each, in WooCommerce's own format
+            // (implode(' ', $order->get_address())), read after save() so it
+            // reflects the identity just set.
+            $this->write_address_index_meta(
+                $order_id,
+                implode( ' ', $order->get_address( 'billing' ) ),
+                implode( ' ', $order->get_address( 'shipping' ) )
+            );
 
             $stats['updated']++;
         }
