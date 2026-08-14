@@ -1,8 +1,11 @@
 {
   "name": "order-simulator-woocommerce",
-  "version": "1.2.4",
+  "version": "1.2.6",
   "repository": "git@github.com:theritesite/order-simulator-woocommerce.git",
-  "author": "Parker Mathewson <theritesites@gmail.com>",
+  "author": {
+    "name": "TheRiteSites",
+    "url": "https://www.theritesites.com"
+  },
   "license": "GPL-2.0",
   "scripts": {
     "clean": "rm -rf zip_files/*",
